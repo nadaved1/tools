@@ -1,5 +1,6 @@
 #!/bin/bash
 SCRIPT=`basename $0`
+step=10
 while [ "$#" -gt 0 ]; do
 	case `echo $1 | tr "[A-Z]" "[a-z]"` in
       	-pid|-p)
@@ -19,12 +20,13 @@ done
 
 while : 
 do
+	echo "------------- gstack -------------"
 	gstack $1
 	retVal=$?
 	if [ $retVal -ne 0 ]; then
 		echo "$pid Done"
 		break
 	fi
-	sleep 10
+	sleep $step
 done
 echo "$1 Finished.."
