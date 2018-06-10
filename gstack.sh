@@ -11,6 +11,10 @@ while [ "$#" -gt 0 ]; do
 			step=$2
 			shift
 			;;
+		-help|-h)
+			echo "$SCRIPT -pid #pid [-sleep #sec]
+			exit 0
+			;;
 		*)
 			echo "$SCRIPT: Unknown option $1"
 			exit 1
@@ -21,7 +25,7 @@ done
 while : 
 do
 	echo "------------- gstack -------------"
-	gstack $1
+	gstack $pid
 	retVal=$?
 	if [ $retVal -ne 0 ]; then
 		echo "$pid Done"
