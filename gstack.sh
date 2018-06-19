@@ -12,7 +12,7 @@ while [ "$#" -gt 0 ]; do
 			shift
 			;;
 		-help|-h)
-			echo "$SCRIPT -pid #pid [-sleep #sec]
+			echo "$SCRIPT -pid <pid_number> [-sleep <sec>]"
 			exit 0
 			;;
 		*)
