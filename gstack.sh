@@ -1,6 +1,7 @@
 #!/bin/bash
 SCRIPT=`basename $0`
 step=10
+log=gstack.log
 while [ "$#" -gt 0 ]; do
 	case `echo $1 | tr "[A-Z]" "[a-z]"` in
       	-pid|-p)
@@ -9,6 +10,10 @@ while [ "$#" -gt 0 ]; do
 		  	;;
 		-sleep)
 			step=$2
+			shift
+			;;
+		-log)
+			log=$2
 			shift
 			;;
 		-help|-h)
@@ -24,13 +29,16 @@ done
 
 while : 
 do
-	echo "------------- gstack -------------"
-	gstack $pid
+	echo " Options used:" | tee $log
+	echo "    step=$step" | tee $log
+	echo "    pid=$pid"   | tee $log
+	echo "------------- gstack -------------" | tee $log
+	gstack $pid | tee $log
 	retVal=$?
 	if [ $retVal -ne 0 ]; then
-		echo "$pid Done"
+		echo "$pid Done" | tee $log
 		break
 	fi
 	sleep $step
 done
-echo "$1 Finished.."
+echo "$1 Finished.." | tee $log
