@@ -30,16 +30,16 @@ done
 while : 
 do
 	echo " Options used:" | tee $log
-	echo "    step=$step" | tee $log
-	echo "    pid=$pid"   | tee $log
-	echo "------------- gstack -------------" | tee $log
+	echo "    step=$step" | tee -a $log
+	echo "    pid=$pid"   | tee -a $log
+	echo "------------- gstack -------------" | tee -a $log
 	ps -p $pid >& /dev/null
 	retVal=$?
 	if [ $retVal -ne 0 ]; then
-		echo "$pid Done" | tee $log
+		echo "$pid Done" | tee -a $log
 		break
 	fi
-	gstack $pid | tee $log
+	gstack $pid | tee -a $log
 	sleep $step
 done
-echo "$1 Finished.." | tee $log
+echo "$1 Finished.." | tee -a $log
