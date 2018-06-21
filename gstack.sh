@@ -33,12 +33,13 @@ do
 	echo "    step=$step" | tee $log
 	echo "    pid=$pid"   | tee $log
 	echo "------------- gstack -------------" | tee $log
-	gstack $pid | tee $log
+	ps -p $pid >& /dev/null
 	retVal=$?
 	if [ $retVal -ne 0 ]; then
 		echo "$pid Done" | tee $log
 		break
 	fi
+	gstack $pid | tee $log
 	sleep $step
 done
 echo "$1 Finished.." | tee $log
