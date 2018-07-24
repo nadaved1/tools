@@ -27,12 +27,13 @@ while [ "$#" -gt 0 ]; do
    	shift
 done
 
+echo " Options used:" | tee $log
+echo "    step=$step" | tee -a $log
+echo "    pid=$pid"   | tee -a $log
+echo "------------- gstack -------------" | tee -a $log
+
 while : 
 do
-	echo " Options used:" | tee $log
-	echo "    step=$step" | tee -a $log
-	echo "    pid=$pid"   | tee -a $log
-	echo "------------- gstack -------------" | tee -a $log
 	ps -p $pid >& /dev/null
 	retVal=$?
 	if [ $retVal -ne 0 ]; then
