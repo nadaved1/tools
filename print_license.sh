@@ -24,7 +24,8 @@ done
 if [ $file = 'none' ]; then                                                  
         echo "Must specify a soma\\spc file with -file"                      
         exit 1                                                               
-fi                                                                           
+fi
+fullfile=`readlink -f $file`
 echo $file      | grep '\.sv$'                                               
 retVal=$?                                                                    
 if [ $retVal -eq "0" ]; then                                                 
@@ -39,12 +40,12 @@ mkdir print_lic_tmp_dir
 cd print_lic_tmp_dir
 if [ $cfg -eq "1" ]; then
         echo "0. Convert to .spc file"
-        $DENALI/bin/pureview -batch -convert v0001 $file > $model.spc 2> /dev/null
+        $DENALI/bin/pureview -batch -convert v0001 $fullfile > $model.spc 2> /dev/null
         echo "1. Generate the wrapper file $model.v"                              
         $DENALI/bin/pureview -batch -generate all model -genoutput $model.v $model.spc &> /dev/null
 else                                                                                               
         echo "1. Generate the wrapper file $model.v"                                               
-        $DENALI/bin/pureview -batch -generate all model -genoutput $model.v $file &> /dev/null     
+        $DENALI/bin/pureview -batch -generate all model -genoutput $model.v $fullfile &> /dev/null     
 fi                                                                                                 
 echo "2. Generate tb.v"                                                                            
 echo "module tb;" >> tb.v                                                                          
