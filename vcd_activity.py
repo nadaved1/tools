@@ -25,6 +25,7 @@ import sys
 import csv
 import json
 import time
+import html
 from datetime import datetime
 from multiprocessing import Pool
 
@@ -55,6 +56,14 @@ def human_bar(frac, width=30):
     frac = max(0.0, min(1.0, frac))
     filled = int(frac * width)
     return '#' * filled + '-' * (width - filled)
+
+
+def human_size(nbytes):
+    n = float(nbytes)
+    for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB'):
+        if n < 1024 or unit == 'TiB':
+            return ('%d %s' % (n, unit)) if unit == 'B' else ('%.2f %s' % (n, unit))
+        n /= 1024
 
 
 def human_time(seconds):
@@ -195,21 +204,31 @@ def run_native_parallel(path, body_start, file_size, all_ids,
 
 
 def parse_header(path, prog=None):
-    """Read the VCD header.  Returns (all_ids, id_names, timescale, bytes_read,
-    file_handle) with the handle positioned right after $enddefinitions."""
+    """Read the VCD header.  Returns (all_ids, id_names, meta, bytes_read,
+    file_handle) with the handle positioned right after $enddefinitions.
+    meta has 'date', 'version' and 'timescale' (each '' if absent)."""
     id_names = {}
     all_ids = set()
-    timescale = None
+    meta = {'date': '', 'version': '', 'timescale': ''}
     bytes_read = 0
     nvars = 0
     hdr_tick = 0
-    in_timescale = False
+    pending = None                            # multi-line field being collected
 
     f = open(path, 'rb')
     for raw in f:
         bytes_read += len(raw)
         line = raw.decode('ascii', 'replace').strip()
         if not line:
+            continue
+        if pending is not None:               # inside $date/$version/$timescale
+            if '$end' in line:
+                tok = line.replace('$end', '').strip()
+                if tok:
+                    meta[pending] = (meta[pending] + ' ' + tok).strip()
+                pending = None
+            else:
+                meta[pending] = (meta[pending] + ' ' + line).strip()
             continue
         if line.startswith('$var'):
             parts = line.split()             # $var <type> <size> <id> <name> ...
@@ -221,26 +240,22 @@ def parse_header(path, prog=None):
                 prog.marquee('reading header: %d signals (%d vars)'
                              % (len(all_ids), nvars), hdr_tick)
                 hdr_tick += 1
-        elif line.startswith('$timescale'):
-            rest = line[len('$timescale'):].replace('$end', '').strip()
-            if rest:
-                timescale = rest
+        elif (line.startswith('$timescale') or line.startswith('$date')
+              or line.startswith('$version')):
+            kw = line.split(None, 1)[0]       # $timescale | $date | $version
+            name = kw[1:]
+            rest = line[len(kw):]
+            if '$end' in rest:
+                meta[name] = rest.replace('$end', '').strip()
             else:
-                in_timescale = True
-        elif in_timescale:
-            if '$end' in line:
-                tok = line.replace('$end', '').strip()
-                if tok:
-                    timescale = tok
-                in_timescale = False
-            elif line:
-                timescale = line
+                meta[name] = rest.strip()
+                pending = name
         elif line.startswith('$enddefinitions'):
             break
     if prog is not None:
         prog.marquee_done('reading header: %d signals (%d vars)'
                           % (len(all_ids), nvars))
-    return all_ids, id_names, timescale, bytes_read, f
+    return all_ids, id_names, meta, bytes_read, f
 
 
 # --------------------------------------------------------------------------- #
@@ -535,8 +550,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 font-family: "Segoe UI", system-ui, Arial, sans-serif; }}
   .wrap {{ padding: 18px 20px; }}
   h1 {{ font-size: 17px; font-weight: 600; margin: 0 0 4px; color: #e6edf3; }}
-  .sub {{ font-size: 12px; color: #8b949e; margin: 0 0 14px; }}
-  #chart {{ width: 100%; height: 78vh; }}
+  .sub {{ font-size: 12px; color: #8b949e; margin: 0 0 12px; }}
+  .meta {{ display: flex; flex-wrap: wrap; gap: 10px 26px; background: #161b22;
+           border: 1px solid #21262d; border-radius: 8px; padding: 11px 16px;
+           margin: 0 0 16px; font-size: 12px; }}
+  .meta .k {{ color: #8b949e; margin-right: 7px;
+              text-transform: uppercase; letter-spacing: .04em; font-size: 11px; }}
+  .meta .v {{ color: #e6edf3; font-weight: 600; }}
+  #chart {{ width: 100%; height: 74vh; }}
   .footer {{ margin-top: 14px; padding-top: 10px; border-top: 1px solid #21262d;
              font-size: 12px; color: #8b949e; }}
   .footer b {{ color: #c9d1d9; font-weight: 600; }}
@@ -546,6 +567,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <div class="wrap">
   <h1>{title}</h1>
   <p class="sub">{subtitle}</p>
+  <div class="meta">
+    <div><span class="k">Dumped by</span><span class="v">{m_tool}</span></div>
+    <div><span class="k">Dump date</span><span class="v">{m_date}</span></div>
+    <div><span class="k">Timescale</span><span class="v">{m_scale}</span></div>
+    <div><span class="k">VCD size</span><span class="v">{m_size}</span></div>
+  </div>
   <div id="chart"></div>
   <div class="footer">Generated: <b>{generated}</b></div>
 </div>
@@ -581,7 +608,39 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 """
 
 
-def render_html(csv_path, html_path, title, subtitle, xlabel, generated):
+def _decimate(xs, ys, max_points):
+    """Down-sample (xs, ys) for display, keeping the min AND max of each bucket.
+
+    Inlining millions of points makes the HTML huge and the browser choke.
+    Bucketing into ~max_points/2 ranges and emitting each bucket's lowest and
+    highest sample (in time order) preserves the visual envelope - activity
+    spikes are never dropped - while bounding the embedded data.
+    """
+    n = len(xs)
+    if max_points <= 0 or n <= max_points:
+        return xs, ys, n
+    nb = max(1, max_points // 2)
+    ox, oy = [], []
+    for b in range(nb):
+        lo = (b * n) // nb
+        hi = ((b + 1) * n) // nb
+        if hi <= lo:
+            continue
+        imin = imax = lo
+        for i in range(lo + 1, hi):
+            if ys[i] < ys[imin]:
+                imin = i
+            elif ys[i] > ys[imax]:
+                imax = i
+        a, c = (imin, imax) if imin <= imax else (imax, imin)
+        ox.append(xs[a]); oy.append(ys[a])
+        if c != a:
+            ox.append(xs[c]); oy.append(ys[c])
+    return ox, oy, n
+
+
+def render_html(csv_path, html_path, title, subtitle, xlabel, generated,
+                max_points, meta, vcd_size):
     xs, ys = [], []
     with open(csv_path, newline='') as fh:
         r = csv.DictReader(fh)
@@ -589,11 +648,18 @@ def render_html(csv_path, html_path, title, subtitle, xlabel, generated):
         for row in r:
             xs.append(int(row[xcol]))
             ys.append(float(row['percent_changed']))
-    html = HTML_TEMPLATE.format(
+    xs, ys, total = _decimate(xs, ys, max_points)
+    if len(xs) < total:
+        subtitle += (' | plotted %s of %s points (min/max decimated)'
+                     % (f'{len(xs):,}', f'{total:,}'))
+    esc = lambda s: html.escape(s) if s else 'n/a'
+    page = HTML_TEMPLATE.format(
         title=title, subtitle=subtitle, xlabel=xlabel, generated=generated,
-        x_json=json.dumps(xs), y_json=json.dumps(ys))
+        x_json=json.dumps(xs), y_json=json.dumps(ys),
+        m_tool=esc(meta.get('version')), m_date=esc(meta.get('date')),
+        m_scale=esc(meta.get('timescale')), m_size=esc(human_size(vcd_size)))
     with open(html_path, 'w', encoding='utf-8') as out:
-        out.write(html)
+        out.write(page)
 
 
 # --------------------------------------------------------------------------- #
@@ -610,6 +676,10 @@ def main():
                     metavar='PATH',
                     help='also render a dark-themed interactive HTML graph '
                          '(optional output path)')
+    ap.add_argument('--max-points', type=int, default=100000, metavar='N',
+                    help='cap points embedded in the HTML via min/max '
+                         'decimation, keeping spikes (default: 100000; '
+                         '0 = embed every point)')
     ap.add_argument('--by-clock', action='store_true',
                     help='bucket per clock cycle instead of per native timestamp')
     ap.add_argument('--clock', default='clk',
@@ -641,8 +711,8 @@ def main():
     out_path = args.output or (base + '.activity.csv')
 
     prog = Progress(total_size, not args.no_progress)
-    all_ids, id_names, timescale, bytes_read, f = parse_header(args.vcd, prog)
-    unit = timescale or 'time units'
+    all_ids, id_names, meta, bytes_read, f = parse_header(args.vcd, prog)
+    unit = meta['timescale'] or 'time units'
 
     out = open(out_path, 'w', newline='')
     writer = csv.writer(out)
@@ -698,7 +768,8 @@ def main():
         html_path = (base + '.activity.html') if args.html == '__AUTO__' \
             else args.html
         title = 'VCD switching activity - %s' % os.path.basename(args.vcd)
-        render_html(out_path, html_path, title, subtitle, xlabel, generated)
+        render_html(out_path, html_path, title, subtitle, xlabel, generated,
+                    args.max_points, meta, total_size)
         sys.stderr.write('html: %s\n' % html_path)
 
     sys.stderr.write('done: signals=%d  rows=%d  cores=%d  time=%s  -> %s\n'
