@@ -204,12 +204,18 @@ def run_native_parallel(path, body_start, file_size, all_ids,
 
 
 def parse_header(path, prog=None):
-    """Read the VCD header.  Returns (all_ids, id_names, meta, bytes_read,
+    """Read the VCD header.  Returns (all_ids, id_names, meta, hier, bytes_read,
     file_handle) with the handle positioned right after $enddefinitions.
-    meta has 'date', 'version' and 'timescale' (each '' if absent)."""
+    meta has 'date', 'version' and 'timescale' (each '' if absent).
+    hier has 'modules' (list of scope-path strings) and 'id2mod'
+    (identifier -> index into modules), built from $scope/$upscope."""
     id_names = {}
     all_ids = set()
     meta = {'date': '', 'version': '', 'timescale': ''}
+    modules = []
+    mod_index = {}                            # scope path -> index in modules
+    id2mod = {}                               # identifier -> module index
+    scope = []                                # current $scope stack
     bytes_read = 0
     nvars = 0
     hdr_tick = 0
@@ -235,11 +241,26 @@ def parse_header(path, prog=None):
             ident, name = parts[3], parts[4]
             all_ids.add(ident)
             id_names.setdefault(ident, name)
+            if ident not in id2mod:
+                path_str = '.'.join(scope) if scope else '(top)'
+                mi = mod_index.get(path_str)
+                if mi is None:
+                    mi = len(modules)
+                    mod_index[path_str] = mi
+                    modules.append(path_str)
+                id2mod[ident] = mi
             nvars += 1
             if prog is not None and (nvars & 0x3F) == 0:
                 prog.marquee('reading header: %d signals (%d vars)'
                              % (len(all_ids), nvars), hdr_tick)
                 hdr_tick += 1
+        elif line.startswith('$scope'):
+            parts = line.split()             # $scope <type> <name> $end
+            if len(parts) >= 3:
+                scope.append(parts[2])
+        elif line.startswith('$upscope'):
+            if scope:
+                scope.pop()
         elif (line.startswith('$timescale') or line.startswith('$date')
               or line.startswith('$version')):
             kw = line.split(None, 1)[0]       # $timescale | $date | $version
@@ -255,7 +276,153 @@ def parse_header(path, prog=None):
     if prog is not None:
         prog.marquee_done('reading header: %d signals (%d vars)'
                           % (len(all_ids), nvars))
-    return all_ids, id_names, meta, bytes_read, f
+    hier = {'modules': modules, 'id2mod': id2mod}
+    return all_ids, id_names, meta, hier, bytes_read, f
+
+
+# --------------------------------------------------------------------------- #
+# Region analysis: which logic toggles, and how the active set shifts in time.
+#
+# Time is split into NBINS equal columns over [t_min, t_max].  We accumulate a
+# matrix M[bin][module] = number of toggles by signals of that module in that
+# time column.  From it we derive both views:
+#   * the heatmap (modules x time)               -> WHICH logic toggles
+#   * per-bin active-module set + Jaccard         -> SAME vs DIFFERENT regions
+# Boundary effect: a signal's first appearance inside a parse chunk is skipped
+# (its previous value lives in an earlier chunk); that is at most one toggle per
+# signal per chunk - negligible for a coarse heatmap.
+# --------------------------------------------------------------------------- #
+def time_range(path, body_start, file_size):
+    """Cheaply find (t_min, t_max) without a full pass (head read + tail read)."""
+    tmin = tmax = None
+    with open(path, 'rb') as f:
+        f.seek(body_start)
+        for _ in range(200000):
+            line = f.readline()
+            if not line:
+                break
+            if line[:1] == b'#' and line[1:2].isdigit():
+                tmin = int(line.strip()[1:])
+                break
+        tail = min(file_size, 1 << 20)
+        f.seek(file_size - tail)
+        for ln in reversed(f.read().split(b'\n')):
+            s = ln.strip()
+            if s[:1] == b'#' and s[1:2].isdigit():
+                tmax = int(s[1:])
+                break
+    return tmin, tmax
+
+
+_HM = {}
+
+
+def _hm_init(id2mod, nbins, tmin, tspan, nmods):
+    _HM.update(id2mod=id2mod, nbins=nbins, tmin=tmin, tspan=tspan, nmods=nmods)
+
+
+def _module_worker(task):
+    """Accumulate {bin: [per-module toggle counts]} for one '#'-aligned range."""
+    path, start, end = task
+    id2mod = _HM['id2mod']
+    nbins, tmin, tspan, nmods = (_HM['nbins'], _HM['tmin'],
+                                 _HM['tspan'], _HM['nmods'])
+    counts = {}
+    last = {}
+    cur_bin = 0
+    pos = start
+    with open(path, 'rb') as f:
+        f.seek(start)
+        while pos < end:
+            line = f.readline()
+            if not line:
+                break
+            pos += len(line)
+            s = line.strip()
+            if not s:
+                continue
+            c = s[0:1]
+            if c == b'#':
+                t = int(s[1:])
+                b = (t - tmin) * nbins // tspan
+                cur_bin = 0 if b < 0 else (nbins - 1 if b >= nbins else b)
+                continue
+            if c == b'$':
+                continue
+            ident, val = _parse_change_bytes(s)
+            if ident is None:
+                continue
+            prev = last.get(ident)
+            if prev == val:
+                continue
+            first = ident not in last
+            last[ident] = val
+            if first:
+                continue                          # boundary: prev lives elsewhere
+            m = id2mod.get(ident)                  # id2mod is keyed by bytes
+            if m is None:
+                continue
+            row = counts.get(cur_bin)
+            if row is None:
+                row = counts[cur_bin] = [0] * nmods
+            row[m] += 1
+    return counts
+
+
+def collect_module_activity(path, body_start, file_size, hier, nbins,
+                            tmin, tmax, ncores, prog):
+    """Build M[bin][module] = toggle count, used to derive set-similarity."""
+    # key the map by bytes so workers skip per-toggle decoding
+    id2mod = {k.encode('ascii', 'replace'): v
+              for k, v in hier['id2mod'].items()}
+    nmods = len(hier['modules'])
+    tspan = max(1, tmax - tmin + 1)
+    nchunks = max(1, ncores * 4)
+    with open(path, 'rb') as f:
+        starts = [_align_to_hash(f, 0, False)]
+        span = file_size - body_start
+        for i in range(1, nchunks):
+            off = _align_to_hash(f, body_start + span * i // nchunks, True)
+            if off is not None and off > starts[-1]:
+                starts.append(off)
+    starts = [s for s in starts if s is not None]
+    ends = starts[1:] + [file_size]
+    tasks = [(path, st, en) for st, en in zip(starts, ends) if st < en]
+
+    M = [[0] * nmods for _ in range(nbins)]
+    ntasks = len(tasks)
+    with Pool(ncores, initializer=_hm_init,
+              initargs=(id2mod, nbins, tmin, tspan, nmods)) as pool:
+        for done, counts in enumerate(
+                pool.imap_unordered(_module_worker, tasks), 1):
+            for b, arr in counts.items():
+                row = M[b]
+                for m in range(nmods):
+                    if arr[m]:
+                        row[m] += arr[m]
+            prog.update_frac(done / ntasks, 'regions: chunk %d/%d' % (done, ntasks))
+    prog.done('regions: %d modules x %d time bins' % (nmods, nbins))
+    return M
+
+
+def similarity_regimes(M, nbins, threshold):
+    """Per-bin set-similarity to the previous bin, and a regime id that bumps
+    whenever similarity drops below threshold (i.e. the active set changed)."""
+    active = [frozenset(m for m, v in enumerate(M[b]) if v) for b in range(nbins)]
+    sim = [1.0] * nbins
+    regime = [0] * nbins
+    rid = 0
+    for b in range(1, nbins):
+        a, c = active[b - 1], active[b]
+        uni = len(a | c)
+        j = (len(a & c) / uni) if uni else 1.0
+        sim[b] = j
+        if j < threshold:
+            rid += 1
+        regime[b] = rid
+    if nbins > 1:
+        sim[0] = sim[1]
+    return sim, regime
 
 
 # --------------------------------------------------------------------------- #
@@ -577,35 +744,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="footer">Generated: <b>{generated}</b></div>
 </div>
 <script>
-  const x = {x_json};
-  const y = {y_json};
-  const trace = {{
-    x: x, y: y, type: 'scattergl', mode: 'lines',
-    line: {{ color: '#58a6ff', width: 1 }},
-    fill: 'tozeroy', fillcolor: 'rgba(88,166,255,0.12)',
-    hovertemplate: '{xlabel} = %{{x}}<br>%{{y:.2f}} %<extra></extra>'
-  }};
-  const layout = {{
-    paper_bgcolor: '#0d1117', plot_bgcolor: '#0d1117',
-    font: {{ color: '#c9d1d9' }},
-    margin: {{ l: 64, r: 24, t: 12, b: 56 }},
-    xaxis: {{ title: '{xlabel}', gridcolor: '#21262d', zerolinecolor: '#30363d',
-              showspikes: true, spikecolor: '#484f58', spikethickness: 1,
-              spikemode: 'across', spikedash: 'dot' }},
-    yaxis: {{ title: '% of signals changed', gridcolor: '#21262d',
-              zerolinecolor: '#30363d', rangemode: 'tozero', ticksuffix: ' %' }}
-  }};
-  const config = {{
-    responsive: true, scrollZoom: true, displaylogo: false,
-    modeBarButtonsToRemove: ['select2d', 'lasso2d'],
-    toImageButtonOptions: {{ format: 'png', filename: 'vcd_activity',
-                             scale: 2 }}
-  }};
-  Plotly.newPlot('chart', [trace], layout, config);
+{script}
 </script>
 </body>
 </html>
 """
+
+# palette cycled across regimes (background bands)
+_REGIME_COLORS = ['#1f6feb', '#8957e5', '#238636', '#9e6a03',
+                  '#bc4c00', '#1b7c83', '#a371f7', '#57606a']
 
 
 def _decimate(xs, ys, max_points):
@@ -639,8 +786,26 @@ def _decimate(xs, ys, max_points):
     return ox, oy, n
 
 
+def _regime_bands(bin_x, regime, bin_w):
+    """Contiguous runs of equal regime id -> background rectangle shapes."""
+    shapes = []
+    if not regime:
+        return shapes
+    b0 = 0
+    for b in range(1, len(regime) + 1):
+        if b == len(regime) or regime[b] != regime[b0]:
+            col = _REGIME_COLORS[regime[b0] % len(_REGIME_COLORS)]
+            shapes.append({
+                'type': 'rect', 'xref': 'x', 'yref': 'paper', 'layer': 'below',
+                'x0': bin_x[b0] - bin_w / 2.0, 'x1': bin_x[b - 1] + bin_w / 2.0,
+                'y0': 0, 'y1': 1, 'line': {'width': 0},
+                'fillcolor': col, 'opacity': 0.13})
+            b0 = b
+    return shapes
+
+
 def render_html(csv_path, html_path, title, subtitle, xlabel, generated,
-                max_points, meta, vcd_size):
+                max_points, meta, vcd_size, region=None):
     xs, ys = [], []
     with open(csv_path, newline='') as fh:
         r = csv.DictReader(fh)
@@ -652,10 +817,61 @@ def render_html(csv_path, html_path, title, subtitle, xlabel, generated,
     if len(xs) < total:
         subtitle += (' | plotted %s of %s points (min/max decimated)'
                      % (f'{len(xs):,}', f'{total:,}'))
+
+    region = region or {}
+    nbins = region.get('nbins', 0)
+    tmin = region.get('tmin', 0)
+    tspan = region.get('tspan', 1)
+    sim = region.get('sim')
+    regime = region.get('regime')
+    bin_w = tspan / nbins if nbins else 1
+    bin_x = [tmin + (b + 0.5) * tspan / nbins for b in range(nbins)] if nbins else []
+
+    # ---- activity line (+ optional similarity + regime bands) --------------
+    traces = [{
+        'x': xs, 'y': ys, 'type': 'scattergl', 'mode': 'lines',
+        'name': '% changed', 'line': {'color': '#58a6ff', 'width': 1},
+        'fill': 'tozeroy', 'fillcolor': 'rgba(88,166,255,0.12)',
+        'hovertemplate': xlabel + ' = %{x}<br>%{y:.2f} %<extra></extra>'}]
+    layout = {
+        'paper_bgcolor': '#0d1117', 'plot_bgcolor': '#0d1117',
+        'font': {'color': '#c9d1d9'}, 'showlegend': bool(sim),
+        'legend': {'orientation': 'h', 'y': 1.08, 'x': 0},
+        'margin': {'l': 64, 'r': 60, 't': 28, 'b': 46},
+        'xaxis': {'title': xlabel, 'gridcolor': '#21262d',
+                  'zerolinecolor': '#30363d', 'showspikes': True,
+                  'spikecolor': '#484f58', 'spikethickness': 1,
+                  'spikemode': 'across', 'spikedash': 'dot'},
+        'yaxis': {'title': '% of signals changed', 'gridcolor': '#21262d',
+                  'zerolinecolor': '#30363d', 'rangemode': 'tozero',
+                  'ticksuffix': ' %'}}
+    if sim:
+        traces.append({
+            'x': bin_x, 'y': [round(100 * s, 2) for s in sim], 'yaxis': 'y2',
+            'type': 'scattergl', 'mode': 'lines', 'name': 'set similarity',
+            'line': {'color': '#f0883e', 'width': 1.5},
+            'hovertemplate': 'similarity to prev bin = %{y:.0f} %<extra></extra>'})
+        layout['yaxis2'] = {'title': 'set similarity', 'overlaying': 'y',
+                            'side': 'right', 'range': [0, 100],
+                            'ticksuffix': ' %', 'showgrid': False}
+    if regime:
+        layout['shapes'] = _regime_bands(bin_x, regime, bin_w)
+
+    config = {'responsive': True, 'scrollZoom': True, 'displaylogo': False,
+              'modeBarButtonsToRemove': ['select2d', 'lasso2d'],
+              'toImageButtonOptions': {'format': 'png',
+                                       'filename': 'vcd_activity', 'scale': 2}}
+
+    js = "Plotly.newPlot('chart', %s, %s, %s);" % (
+        json.dumps(traces), json.dumps(layout), json.dumps(config))
+
+    if sim:
+        subtitle += (' | orange = active-module-set similarity to previous bin'
+                     ' (dips/color bands mark where different logic toggles)')
+
     esc = lambda s: html.escape(s) if s else 'n/a'
     page = HTML_TEMPLATE.format(
-        title=title, subtitle=subtitle, xlabel=xlabel, generated=generated,
-        x_json=json.dumps(xs), y_json=json.dumps(ys),
+        title=title, subtitle=subtitle, generated=generated, script=js,
         m_tool=esc(meta.get('version')), m_date=esc(meta.get('date')),
         m_scale=esc(meta.get('timescale')), m_size=esc(human_size(vcd_size)))
     with open(html_path, 'w', encoding='utf-8') as out:
@@ -680,6 +896,12 @@ def main():
                     help='cap points embedded in the HTML via min/max '
                          'decimation, keeping spikes (default: 100000; '
                          '0 = embed every point)')
+    ap.add_argument('--no-similarity', action='store_true',
+                    help='do not render the active-set similarity / regime '
+                         'overlay')
+    ap.add_argument('--time-bins', type=int, default=600, metavar='N',
+                    help='time columns for the similarity overlay '
+                         '(default: 600)')
     ap.add_argument('--by-clock', action='store_true',
                     help='bucket per clock cycle instead of per native timestamp')
     ap.add_argument('--clock', default='clk',
@@ -711,7 +933,7 @@ def main():
     out_path = args.output or (base + '.activity.csv')
 
     prog = Progress(total_size, not args.no_progress)
-    all_ids, id_names, meta, bytes_read, f = parse_header(args.vcd, prog)
+    all_ids, id_names, meta, hier, bytes_read, f = parse_header(args.vcd, prog)
     unit = meta['timescale'] or 'time units'
 
     out = open(out_path, 'w', newline='')
@@ -762,6 +984,28 @@ def main():
         f.close()
     out.close()
 
+    # ---- region analysis (active-set similarity overlay), HTML only --------
+    region = None
+    if args.html is not None and not args.no_similarity:
+        if not hier['modules']:
+            sys.stderr.write('note: no module hierarchy in VCD; '
+                             'skipping similarity overlay.\n')
+        else:
+            tmin, tmax = time_range(args.vcd, bytes_read, total_size)
+            if tmin is None or tmax is None:
+                sys.stderr.write('note: could not determine time range; '
+                                 'skipping similarity overlay.\n')
+            else:
+                nbins = max(1, min(args.time_bins, tmax - tmin + 1))
+                prog.new_bar()
+                M = collect_module_activity(args.vcd, bytes_read, total_size,
+                                            hier, nbins, tmin, tmax,
+                                            args.ncores, prog)
+                sim, regime = similarity_regimes(M, nbins, 0.5)
+                region = {'nbins': nbins, 'tmin': tmin,
+                          'tspan': max(1, tmax - tmin + 1),
+                          'sim': sim, 'regime': regime}
+
     generated = datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')
 
     if args.html is not None:
@@ -769,7 +1013,7 @@ def main():
             else args.html
         title = 'VCD switching activity - %s' % os.path.basename(args.vcd)
         render_html(out_path, html_path, title, subtitle, xlabel, generated,
-                    args.max_points, meta, total_size)
+                    args.max_points, meta, total_size, region)
         sys.stderr.write('html: %s\n' % html_path)
 
     sys.stderr.write('done: signals=%d  rows=%d  cores=%d  time=%s  -> %s\n'
