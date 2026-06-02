@@ -725,6 +725,32 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               text-transform: uppercase; letter-spacing: .04em; font-size: 11px; }}
   .meta .v {{ color: #e6edf3; font-weight: 600; }}
   #chart {{ width: 100%; height: 74vh; }}
+  h2 {{ font-size: 14px; font-weight: 600; margin: 24px 0 10px; color: #e6edf3; }}
+  h2 .hint {{ font-size: 11px; font-weight: 400; color: #8b949e; }}
+  .tree {{ font-size: 12px; }}
+  details.mod {{ border: 1px solid #30363d; border-radius: 6px;
+                 margin: 5px 0; background: #161b22; }}
+  details.mod > summary {{ cursor: pointer; padding: 6px 10px; list-style: none;
+                           display: flex; align-items: center; gap: 9px;
+                           user-select: none; }}
+  details.mod > summary::-webkit-details-marker {{ display: none; }}
+  details.mod > summary::before {{ content: "\\25B8"; color: #8b949e;
+                                   font-size: 10px; transition: transform .12s; }}
+  details.mod[open] > summary::before {{ transform: rotate(90deg); }}
+  .kids {{ padding: 2px 10px 8px 24px; }}
+  .mod.leaf {{ border: 1px dashed #30363d; border-radius: 6px; margin: 4px 0;
+               padding: 5px 10px 5px 28px; background: #0d1117;
+               display: flex; align-items: center; gap: 9px; }}
+  .nm {{ color: inherit; font-weight: 600;
+         font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }}
+  .cnt {{ color: inherit; background: rgba(127,127,127,0.22);
+          border-radius: 10px; padding: 1px 8px; font-size: 11px; }}
+  .agg {{ color: inherit; opacity: .72; font-size: 11px; }}
+  .legend {{ display: inline-flex; align-items: center; gap: 6px;
+             margin-left: 10px; font-weight: 400; vertical-align: middle; }}
+  .legend .bar {{ width: 84px; height: 10px; border-radius: 3px;
+                  border: 1px solid #30363d;
+                  background: linear-gradient(90deg, #ffffff, #ff0000); }}
   .footer {{ margin-top: 14px; padding-top: 10px; border-top: 1px solid #21262d;
              font-size: 12px; color: #8b949e; }}
   .footer b {{ color: #c9d1d9; font-weight: 600; }}
@@ -741,6 +767,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div><span class="k">VCD size</span><span class="v">{m_size}</span></div>
   </div>
   <div id="chart"></div>
+  {hierarchy}
   <div class="footer">Generated: <b>{generated}</b></div>
 </div>
 <script>
@@ -804,8 +831,98 @@ def _regime_bands(bin_x, regime, bin_w):
     return shapes
 
 
+# --------------------------------------------------------------------------- #
+# Scope hierarchy -> nested "block diagram"
+#
+# parse_header already flattened $scope/$upscope into hier['modules'] (dotted
+# scope paths, in first-appearance order) and hier['id2mod'] (identifier ->
+# module index).  Here we fold the dotted paths back into a tree, tag each node
+# with the number of signals declared directly in that scope, and emit nested,
+# collapsible boxes - the containment view of the design that the scope section
+# encodes losslessly.
+# --------------------------------------------------------------------------- #
+def _build_module_tree(hier):
+    modules = hier.get('modules', [])
+    id2mod = hier.get('id2mod', {})
+    direct = [0] * len(modules)                    # signals declared in each scope
+    for mi in id2mod.values():
+        if 0 <= mi < len(direct):
+            direct[mi] += 1
+    root = {'name': '', 'children': {}, 'direct': 0, 'idx': None}
+    for idx, path in enumerate(modules):
+        parts = [path] if path == '(top)' else path.split('.')
+        node = root
+        for p in parts:                            # create intermediate scopes too
+            node = node['children'].setdefault(
+                p, {'name': p, 'children': {}, 'direct': 0, 'idx': None})
+        node['direct'] = direct[idx]
+        node['idx'] = idx                          # links node back to mod_tot[idx]
+
+    def agg(n):                                    # subtree signal totals
+        t = n['direct']
+        for c in n['children'].values():
+            t += agg(c)
+        n['total'] = t
+        return t
+    agg(root)
+    return root
+
+
+def _heat_style(t):
+    """Inline 'background/color' for a white(0)->red(1) box, with text color
+    flipped to stay legible against the chosen background luminance."""
+    t = 0.0 if t < 0 else (1.0 if t > 1 else t)
+    g = int(round(255 * (1 - t)))                  # white #ffffff -> red #ff0000
+    lum = 76.245 + 0.701 * g                       # 0.299*R + (0.587+0.114)*g
+    fg = '#0d1117' if lum >= 150 else '#f0f6fc'
+    return 'background:#%02x%02x%02x;color:%s' % (255, g, g, fg)
+
+
+def _render_module_node(node, depth, esc, mod_tot, amax):
+    name = esc(node['name'])
+    kids = node['children']
+    act = mod_tot[node['idx']] if (mod_tot and node['idx'] is not None) else 0
+    style = (' style="%s"' % _heat_style(act / amax if amax else 0.0)
+             if mod_tot is not None else '')
+    tip = ' title="%d toggles (own signals)"' % act if mod_tot is not None else ''
+    if not kids:                                   # leaf scope
+        return ('<div class="mod leaf"%s%s><span class="nm">%s</span>'
+                '<span class="cnt">%d sig</span></div>'
+                % (style, tip, name, node['direct']))
+    badge = ('<span class="cnt">%d sig</span>' % node['direct']
+             if node['direct'] else '')
+    agg_b = '<span class="agg">%d total</span>' % node.get('total', 0)
+    inner = ''.join(_render_module_node(c, depth + 1, esc, mod_tot, amax)
+                    for c in kids.values())
+    open_attr = ' open' if depth < 2 else ''       # top levels expanded by default
+    return ('<details class="mod"%s><summary%s%s><span class="nm">%s</span>%s%s'
+            '</summary><div class="kids">%s</div></details>'
+            % (open_attr, style, tip, name, badge, agg_b, inner))
+
+
+def render_hierarchy_html(hier, esc, mod_tot=None):
+    root = _build_module_tree(hier)
+    if not root['children']:
+        return ''
+    nmods = len(hier.get('modules', []))
+    nsig = len(hier.get('id2mod', {}))
+    amax = max(mod_tot) if mod_tot else 0
+    body = ''.join(_render_module_node(c, 0, esc, mod_tot, amax)
+                   for c in root['children'].values())
+    legend = ''
+    if mod_tot is not None:
+        legend = ('<span class="legend">low<span class="bar"></span>high '
+                  '(max %d toggles)</span>' % amax)
+    return ('<div class="hier"><h2>Module hierarchy '
+            '<span class="hint">(scope block diagram &mdash; %d scopes, '
+            '%d signals; color = own switching activity, not sub-scopes; '
+            'click a box to collapse)</span>%s</h2>'
+            '<div class="tree">%s</div></div>'
+            % (nmods, nsig, legend, body))
+
+
 def render_html(csv_path, html_path, title, subtitle, xlabel, generated,
-                max_points, meta, vcd_size, region=None):
+                max_points, meta, vcd_size, region=None, hier=None):
     xs, ys = [], []
     with open(csv_path, newline='') as fh:
         r = csv.DictReader(fh)
@@ -849,7 +966,7 @@ def render_html(csv_path, html_path, title, subtitle, xlabel, generated,
         traces.append({
             'x': bin_x, 'y': [round(100 * s, 2) for s in sim], 'yaxis': 'y2',
             'type': 'scattergl', 'mode': 'lines', 'name': 'set similarity',
-            'line': {'color': '#f0883e', 'width': 1.5},
+            'line': {'color': '#3fb950', 'width': 1.5},
             'hovertemplate': 'similarity to prev bin = %{y:.0f} %<extra></extra>'})
         layout['yaxis2'] = {'title': 'set similarity', 'overlaying': 'y',
                             'side': 'right', 'range': [0, 100],
@@ -866,14 +983,17 @@ def render_html(csv_path, html_path, title, subtitle, xlabel, generated,
         json.dumps(traces), json.dumps(layout), json.dumps(config))
 
     if sim:
-        subtitle += (' | orange = active-module-set similarity to previous bin'
+        subtitle += (' | green = active-module-set similarity to previous bin'
                      ' (dips/color bands mark where different logic toggles)')
 
     esc = lambda s: html.escape(s) if s else 'n/a'
+    mod_tot = (region or {}).get('mod_tot')
+    hierarchy = render_hierarchy_html(hier, html.escape, mod_tot) if hier else ''
     page = HTML_TEMPLATE.format(
         title=title, subtitle=subtitle, generated=generated, script=js,
         m_tool=esc(meta.get('version')), m_date=esc(meta.get('date')),
-        m_scale=esc(meta.get('timescale')), m_size=esc(human_size(vcd_size)))
+        m_scale=esc(meta.get('timescale')), m_size=esc(human_size(vcd_size)),
+        hierarchy=hierarchy)
     with open(html_path, 'w', encoding='utf-8') as out:
         out.write(page)
 
@@ -985,26 +1105,42 @@ def main():
     out.close()
 
     # ---- region analysis (active-set similarity overlay), HTML only --------
+    # This pass feeds the optional similarity overlay AND the hierarchy heatmap,
+    # but neither the activity chart nor the (uncolored) hierarchy depend on it.
+    # Any failure here must therefore degrade to region=None rather than abort
+    # the whole HTML render, which happens later.
     region = None
     if args.html is not None and not args.no_similarity:
-        if not hier['modules']:
-            sys.stderr.write('note: no module hierarchy in VCD; '
-                             'skipping similarity overlay.\n')
-        else:
-            tmin, tmax = time_range(args.vcd, bytes_read, total_size)
-            if tmin is None or tmax is None:
-                sys.stderr.write('note: could not determine time range; '
+        try:
+            if not hier['modules']:
+                sys.stderr.write('note: no module hierarchy in VCD; '
                                  'skipping similarity overlay.\n')
             else:
-                nbins = max(1, min(args.time_bins, tmax - tmin + 1))
-                prog.new_bar()
-                M = collect_module_activity(args.vcd, bytes_read, total_size,
-                                            hier, nbins, tmin, tmax,
-                                            args.ncores, prog)
-                sim, regime = similarity_regimes(M, nbins, 0.5)
-                region = {'nbins': nbins, 'tmin': tmin,
-                          'tspan': max(1, tmax - tmin + 1),
-                          'sim': sim, 'regime': regime}
+                tmin, tmax = time_range(args.vcd, bytes_read, total_size)
+                if tmin is None or tmax is None:
+                    sys.stderr.write('note: could not determine time range; '
+                                     'skipping similarity overlay.\n')
+                else:
+                    nbins = max(1, min(args.time_bins, tmax - tmin + 1))
+                    prog.new_bar()
+                    M = collect_module_activity(args.vcd, bytes_read, total_size,
+                                                hier, nbins, tmin, tmax,
+                                                args.ncores, prog)
+                    sim, regime = similarity_regimes(M, nbins, 0.5)
+                    nmods = len(hier['modules'])   # per-scope total toggles
+                    mod_tot = [0] * nmods
+                    for b in range(nbins):
+                        row = M[b]
+                        for m in range(nmods):
+                            if row[m]:
+                                mod_tot[m] += row[m]
+                    region = {'nbins': nbins, 'tmin': tmin,
+                              'tspan': max(1, tmax - tmin + 1),
+                              'sim': sim, 'regime': regime, 'mod_tot': mod_tot}
+        except Exception as e:
+            sys.stderr.write('note: region analysis failed (%s); rendering '
+                             'without overlay/heatmap.\n' % e)
+            region = None
 
     generated = datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')
 
@@ -1013,7 +1149,7 @@ def main():
             else args.html
         title = 'VCD switching activity - %s' % os.path.basename(args.vcd)
         render_html(out_path, html_path, title, subtitle, xlabel, generated,
-                    args.max_points, meta, total_size, region)
+                    args.max_points, meta, total_size, region, hier)
         sys.stderr.write('html: %s\n' % html_path)
 
     sys.stderr.write('done: signals=%d  rows=%d  cores=%d  time=%s  -> %s\n'
