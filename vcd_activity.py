@@ -20,6 +20,7 @@ Usage:
 """
 
 import argparse
+import gzip
 import os
 import sys
 import csv
@@ -50,6 +51,44 @@ def parse_change(line):
     if c in '01xXzZ-':
         return line[1:], c
     return None, None
+
+
+# --------------------------------------------------------------------------- #
+# Input helpers: transparent gzip + x/z filtering
+# --------------------------------------------------------------------------- #
+def _is_gzip(path):
+    """True if path is gzip-compressed (sniffed by magic bytes, not extension)."""
+    try:
+        with open(path, 'rb') as fh:
+            return fh.read(2) == b'\x1f\x8b'
+    except OSError:
+        return False
+
+
+def _open(path):
+    """Open a VCD for *sequential* reading, decompressing gzip transparently.
+    Yields raw bytes lines.  Note: the returned object is not seekable when the
+    input is gzip, so callers that need random access must guard on _is_gzip."""
+    return gzip.open(path, 'rb') if _is_gzip(path) else open(path, 'rb')
+
+
+def _gzip_isize(path):
+    """Uncompressed size from the gzip footer (ISIZE, modulo 2**32).  Used only
+    as a progress denominator: exact for streams < 4 GiB, approximate beyond."""
+    try:
+        with open(path, 'rb') as fh:
+            fh.seek(-4, os.SEEK_END)
+            return int.from_bytes(fh.read(4), 'little') or 1
+    except OSError:
+        return 1
+
+
+def _has_xz(val):                                    # str value (serial parsing)
+    return 'x' in val or 'X' in val or 'z' in val or 'Z' in val
+
+
+def _has_xz_b(val):                                  # bytes value (worker parsing)
+    return b'x' in val or b'X' in val or b'z' in val or b'Z' in val
 
 
 def human_bar(frac, width=30):
@@ -108,7 +147,7 @@ def _native_worker(task):
       first_occ - {identifier: (timestamp, value)} first appearance in the chunk
       carry_out - {identifier: last value in the chunk}
     """
-    path, start, end = task
+    path, start, end, no_xz = task
     counts = {}
     ts_order = []
     last = {}
@@ -139,6 +178,8 @@ def _native_worker(task):
             ident, val = _parse_change_bytes(s)
             if ident is None:
                 continue
+            if no_xz and _has_xz_b(val):             # ignore x/z, keep last known
+                continue
             prev = last.get(ident)
             if prev is None and ident not in last:
                 last[ident] = val
@@ -166,7 +207,7 @@ def _align_to_hash(f, target, skip_partial):
 
 
 def run_native_parallel(path, body_start, file_size, all_ids,
-                        ncores, writer, prog, avg):
+                        ncores, writer, prog, avg, no_xz):
     total_signals = len(all_ids)
     sink = RowSink(writer, total_signals, avg, 'native')
     nchunks = ncores * 4                           # finer chunks: load balance + progress
@@ -181,7 +222,7 @@ def run_native_parallel(path, body_start, file_size, all_ids,
                 starts.append(off)
     starts = [s for s in starts if s is not None]
     ends = starts[1:] + [file_size]
-    tasks = [(path, st, en) for st, en in zip(starts, ends) if st < en]
+    tasks = [(path, st, en, no_xz) for st, en in zip(starts, ends) if st < en]
 
     global_state = {}
     ntasks = len(tasks)
@@ -221,7 +262,7 @@ def parse_header(path, prog=None):
     hdr_tick = 0
     pending = None                            # multi-line field being collected
 
-    f = open(path, 'rb')
+    f = _open(path)
     for raw in f:
         bytes_read += len(raw)
         line = raw.decode('ascii', 'replace').strip()
@@ -317,8 +358,9 @@ def time_range(path, body_start, file_size):
 _HM = {}
 
 
-def _hm_init(id2mod, nbins, tmin, tspan, nmods):
-    _HM.update(id2mod=id2mod, nbins=nbins, tmin=tmin, tspan=tspan, nmods=nmods)
+def _hm_init(id2mod, nbins, tmin, tspan, nmods, noxz):
+    _HM.update(id2mod=id2mod, nbins=nbins, tmin=tmin, tspan=tspan, nmods=nmods,
+               noxz=noxz)
 
 
 def _module_worker(task):
@@ -327,6 +369,7 @@ def _module_worker(task):
     id2mod = _HM['id2mod']
     nbins, tmin, tspan, nmods = (_HM['nbins'], _HM['tmin'],
                                  _HM['tspan'], _HM['nmods'])
+    noxz = _HM['noxz']
     counts = {}
     last = {}
     cur_bin = 0
@@ -352,6 +395,8 @@ def _module_worker(task):
             ident, val = _parse_change_bytes(s)
             if ident is None:
                 continue
+            if noxz and _has_xz_b(val):              # ignore x/z, keep last known
+                continue
             prev = last.get(ident)
             if prev == val:
                 continue
@@ -370,7 +415,7 @@ def _module_worker(task):
 
 
 def collect_module_activity(path, body_start, file_size, hier, nbins,
-                            tmin, tmax, ncores, prog):
+                            tmin, tmax, ncores, prog, no_xz):
     """Build M[bin][module] = toggle count, used to derive set-similarity."""
     # key the map by bytes so workers skip per-toggle decoding
     id2mod = {k.encode('ascii', 'replace'): v
@@ -392,7 +437,7 @@ def collect_module_activity(path, body_start, file_size, hier, nbins,
     M = [[0] * nmods for _ in range(nbins)]
     ntasks = len(tasks)
     with Pool(ncores, initializer=_hm_init,
-              initargs=(id2mod, nbins, tmin, tspan, nmods)) as pool:
+              initargs=(id2mod, nbins, tmin, tspan, nmods, no_xz)) as pool:
         for done, counts in enumerate(
                 pool.imap_unordered(_module_worker, tasks), 1):
             for b, arr in counts.items():
@@ -568,7 +613,7 @@ class RowSink:
 # --------------------------------------------------------------------------- #
 # Mode 1: native timestamps (default)
 # --------------------------------------------------------------------------- #
-def run_native(f, bytes_read, total_size, all_ids, writer, prog, avg):
+def run_native(f, bytes_read, total_size, all_ids, writer, prog, avg, no_xz):
     total_signals = len(all_ids)
     sink = RowSink(writer, total_signals, avg, 'native')
     last_val = {}
@@ -596,6 +641,8 @@ def run_native(f, bytes_read, total_size, all_ids, writer, prog, avg):
         ident, val = parse_change(line)
         if ident is None:
             continue
+        if no_xz and _has_xz(val):           # ignore x/z, keep last known value
+            continue
         prev = last_val.get(ident)
         if prev == val:
             continue                         # redundant re-dump, not a change
@@ -614,7 +661,7 @@ def run_native(f, bytes_read, total_size, all_ids, writer, prog, avg):
 # Mode 2: per clock cycle (--by-clock)
 # --------------------------------------------------------------------------- #
 def run_by_clock(f, bytes_read, total_size, all_ids, id_names,
-                 clock_name, edge, include_clock, writer, prog, avg):
+                 clock_name, edge, include_clock, writer, prog, avg, no_xz):
     clock_id = None
     for ident, name in id_names.items():
         if name == clock_name:
@@ -676,6 +723,8 @@ def run_by_clock(f, bytes_read, total_size, all_ids, id_names,
             continue
         ident, val = parse_change(line)
         if ident is None:
+            continue
+        if no_xz and _has_xz(val):           # ignore x/z, keep last known value
             continue
         prev = last_val.get(ident)
         if prev == val:
@@ -1035,6 +1084,10 @@ def main():
                     help='average over every N buckets (timestamps, or cycles '
                          'with --by-clock); the row time is the last bucket in '
                          'the group (default: 1 = no averaging)')
+    ap.add_argument('--no-xz', action='store_true',
+                    help='ignore x/z (unknown / high-impedance) values: a '
+                         'transition into or out of x/z is not counted as '
+                         'activity (the last defined value is retained)')
     ap.add_argument('--ncores', type=int, default=1, metavar='N',
                     help='parse on N worker processes (native mode only); '
                          '0 = all available cores')
@@ -1047,9 +1100,19 @@ def main():
     if args.avg < 1:
         args.avg = 1
 
+    is_gz = _is_gzip(args.vcd)
+    if is_gz and args.ncores > 1:
+        # parallel parsing seeks to byte offsets; a gzip stream is not seekable.
+        sys.stderr.write('note: gzip input is read sequentially; ignoring '
+                         '--ncores (running serial).\n')
+        args.ncores = 1
+
     t0 = time.perf_counter()
-    total_size = os.path.getsize(args.vcd) or 1
+    disk_size = os.path.getsize(args.vcd) or 1          # bytes on disk (shown)
+    total_size = _gzip_isize(args.vcd) if is_gz else disk_size  # progress basis
     base = os.path.splitext(args.vcd)[0]
+    if is_gz and base.endswith('.vcd'):                 # foo.vcd.gz -> foo
+        base = base[:-4]
     out_path = args.output or (base + '.activity.csv')
 
     prog = Progress(total_size, not args.no_progress)
@@ -1073,7 +1136,8 @@ def main():
                          ncol, 'total_signals', 'percent_changed'])
         rows, total_signals = run_by_clock(
             f, bytes_read, total_size, all_ids, id_names,
-            args.clock, args.edge, args.include_clock, writer, prog, args.avg)
+            args.clock, args.edge, args.include_clock, writer, prog, args.avg,
+            args.no_xz)
         xlabel = 'time (%s) - cycle start' % unit
         if args.avg > 1:
             subtitle = ('%d signals (clock %r excluded) | %d points '
@@ -1088,10 +1152,11 @@ def main():
             f.close()
             rows, total_signals = run_native_parallel(
                 args.vcd, bytes_read, total_size, all_ids,
-                args.ncores, writer, prog, args.avg)
+                args.ncores, writer, prog, args.avg, args.no_xz)
         else:
             rows, total_signals = run_native(
-                f, bytes_read, total_size, all_ids, writer, prog, args.avg)
+                f, bytes_read, total_size, all_ids, writer, prog, args.avg,
+                args.no_xz)
         xlabel = 'time (%s)' % unit
         if args.avg > 1:
             subtitle = ('%d signals | %d points (mean of %d timestamps each)'
@@ -1099,6 +1164,11 @@ def main():
         else:
             subtitle = ('%d signals | %d native timestamps'
                         % (total_signals, rows))
+
+    if args.no_xz:
+        subtitle += ' | x/z transitions ignored'
+    if is_gz:
+        subtitle += ' | gzip input'
 
     if not f.closed:
         f.close()
@@ -1112,7 +1182,13 @@ def main():
     region = None
     if args.html is not None and not args.no_similarity:
         try:
-            if not hier['modules']:
+            if is_gz:
+                # time_range / collect_module_activity seek into the file, which
+                # a gzip stream cannot do; the (uncolored) hierarchy still renders.
+                sys.stderr.write('note: similarity overlay / heatmap need random '
+                                 'access; skipping for gzip input (use an '
+                                 'uncompressed VCD to enable them).\n')
+            elif not hier['modules']:
                 sys.stderr.write('note: no module hierarchy in VCD; '
                                  'skipping similarity overlay.\n')
             else:
@@ -1125,7 +1201,7 @@ def main():
                     prog.new_bar()
                     M = collect_module_activity(args.vcd, bytes_read, total_size,
                                                 hier, nbins, tmin, tmax,
-                                                args.ncores, prog)
+                                                args.ncores, prog, args.no_xz)
                     sim, regime = similarity_regimes(M, nbins, 0.5)
                     nmods = len(hier['modules'])   # per-scope total toggles
                     mod_tot = [0] * nmods
@@ -1149,7 +1225,7 @@ def main():
             else args.html
         title = 'VCD switching activity - %s' % os.path.basename(args.vcd)
         render_html(out_path, html_path, title, subtitle, xlabel, generated,
-                    args.max_points, meta, total_size, region, hier)
+                    args.max_points, meta, disk_size, region, hier)
         sys.stderr.write('html: %s\n' % html_path)
 
     sys.stderr.write('done: signals=%d  rows=%d  cores=%d  time=%s  -> %s\n'
