@@ -1068,6 +1068,11 @@ def main():
     ap.add_argument('--no-similarity', action='store_true',
                     help='do not render the active-set similarity / regime '
                          'overlay')
+    ap.add_argument('--no-hierarchy', action='store_true',
+                    help='do not render the module hierarchy / scope block '
+                         'diagram (one nested box per scope). For designs with '
+                         'huge scope trees this section dominates the HTML size, '
+                         'so omitting it can shrink the file dramatically')
     ap.add_argument('--time-bins', type=int, default=600, metavar='N',
                     help='time columns for the similarity overlay '
                          '(default: 600)')
@@ -1225,7 +1230,8 @@ def main():
             else args.html
         title = 'VCD switching activity - %s' % os.path.basename(args.vcd)
         render_html(out_path, html_path, title, subtitle, xlabel, generated,
-                    args.max_points, meta, disk_size, region, hier)
+                    args.max_points, meta, disk_size, region,
+                    None if args.no_hierarchy else hier)
         sys.stderr.write('html: %s\n' % html_path)
 
     sys.stderr.write('done: signals=%d  rows=%d  cores=%d  time=%s  -> %s\n'
