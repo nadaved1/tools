@@ -1,0 +1,7 @@
+# local data artifacts (traces and generated outputs)
+__pycache__/
+*.vcd
+*.activity.csv
+*.activity.html
+datapath_activity.csv
+make_big_vcd.py
