@@ -9,9 +9,9 @@
 # of free licenses across all of them.
 #
 # Usage:
-#   print_license.sh [-c <port@host | license_file>] [-lmstat <path>] [-free]
+#   print_license.sh [-lic <port@host | license_file>] [-lmstat <path>] [-free]
 #
-#   -c       license source to query (default: $LM_LICENSE_FILE, then
+#   -lic     license source to query (default: $LM_LICENSE_FILE, then
 #            $SNPSLMD_LICENSE_FILE, then 27020@localhost)
 #   -lmstat  path to the lmstat binary (default: lmstat from PATH, then the
 #            bundled Synopsys SCL copy)
@@ -24,7 +24,7 @@ free_only=0
 
 while [ "$#" -gt 0 ]; do
         case `echo $1 | tr "[A-Z]" "[a-z]"` in
-                -c)
+                -lic)
                         src=$2
                         shift
                         ;;
@@ -63,8 +63,7 @@ if [ -z "$lmstat" ]; then
 fi
 if [ -z "$lmstat" ]; then
         for c in \
-            "$HOME"/tools/synopsys-license/installed/scl/*/linux64/bin/lmstat \
-            "$DENALI"/../../tools.lnx86/bin/lmstat; do
+            "$HOME"/tools/synopsys-license/installed/scl/*/linux64/bin/lmstat; do
                 if [ -x "$c" ]; then
                         lmstat=$c
                         break
