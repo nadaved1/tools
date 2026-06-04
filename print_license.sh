@@ -1,86 +1,131 @@
-#!/usr/bin/sh -f                                                             
-clean=1                                                                      
-cfg=0                                                                        
-SCRIPT=`basename $0`                                                         
-file='none'                                                                  
-while [ "$#" -gt 0 ]; do                                                     
-        case `echo $1 | tr "[A-Z]" "[a-z]"` in                               
-                -noclean)                                                    
-                        clean=0                                              
-                        ;;                                                   
-                -cfg)                                                        
-                        cfg=1                                                
-                        ;;                                                   
-                -f|-file)                                                    
-                        file=$2                                              
-                        shift                                                
-                        ;;                                                   
-                *)                                                           
-                        echo "$SCRIPT: Unknown option \"$1\""                
-                        exit 1                                               
-        esac                                                                 
-        shift                                                                
-done                                                                         
-if [ $file = 'none' ]; then                                                  
-        echo "Must specify a soma\\spc file with -file"                      
-        exit 1                                                               
+#!/usr/bin/sh
+#
+# print_license.sh - list the license features available on a FlexLM server
+#                    and how many of each are free.
+#
+# Queries the license server with `lmstat -a` and prints, for every counted
+# feature, the number of licenses issued / in use / available.  A trailing
+# summary reports how many distinct features were found and the total number
+# of free licenses across all of them.
+#
+# Usage:
+#   print_license.sh [-c <port@host | license_file>] [-lmstat <path>] [-free]
+#
+#   -c       license source to query (default: $LM_LICENSE_FILE, then
+#            $SNPSLMD_LICENSE_FILE, then 27020@localhost)
+#   -lmstat  path to the lmstat binary (default: lmstat from PATH, then the
+#            bundled Synopsys SCL copy)
+#   -free    only list features that currently have >=1 license available
+
+SCRIPT=`basename $0`
+src=''
+lmstat=''
+free_only=0
+
+while [ "$#" -gt 0 ]; do
+        case `echo $1 | tr "[A-Z]" "[a-z]"` in
+                -c)
+                        src=$2
+                        shift
+                        ;;
+                -lmstat)
+                        lmstat=$2
+                        shift
+                        ;;
+                -free)
+                        free_only=1
+                        ;;
+                -h|-help|--help)
+                        grep '^#' "$0" | sed 's/^#//'
+                        exit 0
+                        ;;
+                *)
+                        echo "$SCRIPT: Unknown option \"$1\""
+                        exit 1
+        esac
+        shift
+done
+
+# --- resolve the license source -------------------------------------------
+if [ -z "$src" ]; then
+        if [ -n "$LM_LICENSE_FILE" ]; then
+                src=$LM_LICENSE_FILE
+        elif [ -n "$SNPSLMD_LICENSE_FILE" ]; then
+                src=$SNPSLMD_LICENSE_FILE
+        else
+                src=27020@localhost
+        fi
 fi
-fullfile=`readlink -f $file`
-echo $file      | grep '\.sv$'                                               
-retVal=$?                                                                    
-if [ $retVal -eq "0" ]; then                                                 
-        cfg=1                                                                
-fi                                                                           
-export model=`echo $file | sed 's/^.*\///' | sed 's/\..*$//'`                
-echo " Model: $model"                                                        
 
-\rm -rf print_lic_tmp_dir
-mkdir print_lic_tmp_dir  
-
-cd print_lic_tmp_dir
-if [ $cfg -eq "1" ]; then
-        echo "0. Convert to .spc file"
-        $DENALI/bin/pureview -batch -convert v0001 $fullfile > $model.spc 2> /dev/null
-        echo "1. Generate the wrapper file $model.v"                              
-        $DENALI/bin/pureview -batch -generate all model -genoutput $model.v $model.spc &> /dev/null
-else                                                                                               
-        echo "1. Generate the wrapper file $model.v"                                               
-        $DENALI/bin/pureview -batch -generate all model -genoutput $model.v $fullfile &> /dev/null     
-fi                                                                                                 
-echo "2. Generate tb.v"                                                                            
-echo "module tb;" >> tb.v                                                                          
-echo "  model model();" >> tb.v
-echo "endmodule" >> tb.v
-export FLEXLM_DIAGNOSTICS=3
-
-echo "3. Prepare CDS_LICFLTR.csh"
-echo "#!/bin/csh -f" >> CDS_LICFLTR.csh
-echo "switch (\$1)" >> CDS_LICFLTR.csh
-echo "    case Xcelium_Single_Core:" >> CDS_LICFLTR.csh
-echo "        echo \"USE LIC: \$*\"" >> CDS_LICFLTR.csh
-echo "        exit 0;" >> CDS_LICFLTR.csh
-echo "    breaksw;" >> CDS_LICFLTR.csh
-echo "    case Incisive_Specman_Elite:" >> CDS_LICFLTR.csh
-echo "        exit 0;" >> CDS_LICFLTR.csh
-echo "    breaksw;" >> CDS_LICFLTR.csh
-echo "    default:" >> CDS_LICFLTR.csh
-echo "        echo \"TRY LIC: \$*\"" >> CDS_LICFLTR.csh
-echo "        exit 1;" >> CDS_LICFLTR.csh
-echo "    breaksw;" >> CDS_LICFLTR.csh
-echo "endsw" >> CDS_LICFLTR.csh
-chmod u+x CDS_LICFLTR.csh
-
-echo "4. Build the tb"
-file $DENALI/verilog/libdenpli.so | grep -c "64-bit" > /dev/null
-if [ $? -eq "0" ]; then
-        opt=-64bit
+# --- resolve the lmstat binary --------------------------------------------
+if [ -z "$lmstat" ]; then
+        lmstat=`command -v lmstat 2>/dev/null`
 fi
-xrun -c -clean *.v -cdn_viplib -cdn_vip_root $DENALI/../.. &> log
-export CDS_LICFLTR=./CDS_LICFLTR.csh
-echo "5. Run the tb"
-xrun -R &> log
-grep "TRY LIC" log
-cd - > /dev/null
-if [ $clean -eq "1" ]; then
-        \rm -rf print_lic_tmp_dir
+if [ -z "$lmstat" ]; then
+        for c in \
+            "$HOME"/tools/synopsys-license/installed/scl/*/linux64/bin/lmstat \
+            "$DENALI"/../../tools.lnx86/bin/lmstat; do
+                if [ -x "$c" ]; then
+                        lmstat=$c
+                        break
+                fi
+        done
 fi
+if [ -z "$lmstat" ] || [ ! -x "$lmstat" ]; then
+        echo "$SCRIPT: could not find lmstat; pass it with -lmstat <path>"
+        exit 1
+fi
+
+echo "-----------------------------------------------"
+echo " Available licenses"
+echo " server : $src"
+echo " lmstat : $lmstat"
+echo "-----------------------------------------------"
+
+# Query the server.  lmstat re-execs helpers, so strip any Windows entries
+# (WSL) from PATH that would otherwise break it.
+out=`PATH=/usr/bin:/bin "$lmstat" -a -c "$src" 2>&1`
+
+# Bail out early on the common "server not reachable" error.
+if echo "$out" | grep -q "Cannot connect to license server"; then
+        echo "$out" | grep -i "Error\|Cannot connect"
+        echo "-----------------------------------------------"
+        echo " could not reach the license server"
+        exit 1
+fi
+
+# Parse the feature lines:
+#   Users of <FEATURE>:  (Total of N licenses issued;  Total of M licenses in use)
+printf ' %-34s %8s %8s %8s\n' FEATURE ISSUED IN_USE AVAIL
+echo "-----------------------------------------------"
+echo "$out" | awk -v free_only="$free_only" '
+        /Users of .*Total of .*licenses? issued/ {
+                feat = $0
+                sub(/^.*Users of +/, "", feat)
+                sub(/:.*/,           "", feat)
+
+                # ISSUED follows the FIRST "Total of" (after the "(").
+                issued = $0
+                sub(/^.*\(Total of +/, "", issued)
+                sub(/ +license.*/,     "", issued)
+
+                # IN_USE follows the SECOND "Total of" (after "issued;").
+                used = $0
+                sub(/^.*issued; +Total of +/, "", used)
+                sub(/ +license.*/,            "", used)
+
+                avail = issued - used
+                if (free_only && avail <= 0)
+                        next
+
+                printf " %-34s %8d %8d %8d\n", feat, issued, used, avail
+                nfeat++
+                free_total += avail
+        }
+        END {
+                printf "-----------------------------------------------\n"
+                printf " %d feature(s); %d license(s) available\n", nfeat, free_total
+        }
+'
+echo "-----------------------------------------------"
+exit 0
