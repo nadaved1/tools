@@ -27,8 +27,9 @@ import csv
 import json
 import time
 import html
+import threading
 from datetime import datetime
-from multiprocessing import Pool
+from multiprocessing import Pool, Array
 
 
 # --------------------------------------------------------------------------- #
@@ -138,6 +139,18 @@ def _parse_change_bytes(s):
     return None, None
 
 
+# Shared byte-progress counter: _NPROG[idx] holds the number of bytes worker
+# `idx` has consumed so far.  Each worker writes only its own slot (no lock),
+# and the parent's heartbeat thread sums the slots for a smooth, chunk-spanning
+# progress bar + ETA.  Set per-process by the Pool initializer below.
+_NPROG = None
+
+
+def _nprog_init(arr):
+    global _NPROG
+    _NPROG = arr
+
+
 def _native_worker(task):
     """Parse one '#'-aligned byte range [start, end).
 
@@ -147,7 +160,7 @@ def _native_worker(task):
       first_occ - {identifier: (timestamp, value)} first appearance in the chunk
       carry_out - {identifier: last value in the chunk}
     """
-    path, start, end, no_xz = task
+    path, idx, start, end, no_xz = task
     counts = {}
     ts_order = []
     last = {}
@@ -155,6 +168,7 @@ def _native_worker(task):
     cur = None
     block = set()                                    # distinct signals this block
     pos = start
+    last_report = start
     with open(path, 'rb') as f:
         f.seek(start)
         while pos < end:
@@ -162,6 +176,9 @@ def _native_worker(task):
             if not line:
                 break
             pos += len(line)
+            if _NPROG is not None and pos - last_report >= (1 << 20):
+                _NPROG[idx] = pos - start            # heartbeat: bytes consumed
+                last_report = pos
             s = line.strip()
             if not s:
                 continue
@@ -189,6 +206,8 @@ def _native_worker(task):
                 block.add(ident)                     # set => one count per signal
         if cur is not None:
             counts[cur] = len(block)
+    if _NPROG is not None:
+        _NPROG[idx] = pos - start                    # final flush for this chunk
     return ts_order, counts, first_occ, last
 
 
@@ -222,11 +241,33 @@ def run_native_parallel(path, body_start, file_size, all_ids,
                 starts.append(off)
     starts = [s for s in starts if s is not None]
     ends = starts[1:] + [file_size]
-    tasks = [(path, st, en, no_xz) for st, en in zip(starts, ends) if st < en]
+    pairs = [(st, en) for st, en in zip(starts, ends) if st < en]
+    tasks = [(path, i, st, en, no_xz) for i, (st, en) in enumerate(pairs)]
+    ntasks = len(tasks)
+
+    # Byte-level heartbeat: workers bump _NPROG[idx] as they read; a parent-side
+    # thread sums the slots ~4x/s so the bar (and ETA) move smoothly within a
+    # chunk, not just once per chunk completion.
+    arr = Array('q', ntasks or 1, lock=False)
+    body_bytes = max(1, file_size - starts[0])
+    state = {'rows': 0, 'chunks': 0}
+    stop = threading.Event()
+
+    def heartbeat():
+        while not stop.wait(0.25):
+            done_bytes = 0
+            for i in range(ntasks):
+                done_bytes += arr[i]
+            prog.update_frac(min(1.0, done_bytes / body_bytes),
+                             'rows: %d (chunk %d/%d)'
+                             % (state['rows'], state['chunks'], ntasks),
+                             force=True)
+
+    hb = threading.Thread(target=heartbeat, daemon=True)
+    hb.start()
 
     global_state = {}
-    ntasks = len(tasks)
-    with Pool(ncores) as pool:
+    with Pool(ncores, initializer=_nprog_init, initargs=(arr,)) as pool:
         for done, (ts_order, counts, first_occ, carry_out) in enumerate(
                 pool.imap(_native_worker, tasks), 1):
             # Resolve each signal's first appearance against the carry-in state.
@@ -237,8 +278,10 @@ def run_native_parallel(path, body_start, file_size, all_ids,
             global_state.update(carry_out)         # carry-out becomes next carry-in
             for ts in ts_order:
                 sink.add_native(ts, counts.get(ts, 0))
-            prog.update_frac(done / ntasks, 'rows: %d (chunk %d/%d)'
-                             % (sink.rows, done, ntasks))
+            state['rows'] = sink.rows
+            state['chunks'] = done
+    stop.set()
+    hb.join()
     sink.flush()
     prog.done('rows: %d' % sink.rows)
     return sink.rows, total_signals
@@ -480,6 +523,7 @@ class Progress:
         self.last = -1
         self.base = 0            # byte offset that counts as 0% for this phase
         self.active = False      # is a progress line currently on screen?
+        self.t_start = None      # wall-clock start of the current phase (for ETA)
 
     def update(self, bytes_read, note, force=False):
         span = self.total - self.base
@@ -489,10 +533,16 @@ class Progress:
     def update_frac(self, frac, note, force=False):
         if not self.enabled:
             return
+        if self.t_start is None:
+            self.t_start = time.perf_counter()
         pct = int(frac * 100)
         if force or pct != self.last:
-            sys.stderr.write('\r[%s] %3d%%  %s'
-                             % (human_bar(frac), pct, note))
+            eta = ''
+            el = time.perf_counter() - self.t_start
+            if 0.0 < frac < 1.0 and el > 2:        # converges once a rate is known
+                eta = '  ETA %s' % human_time(el * (1 - frac) / frac)
+            sys.stderr.write('\r[%s] %3d%%  %s%s   '
+                             % (human_bar(frac), pct, note, eta))
             sys.stderr.flush()
             self.last = pct
             self.active = True
@@ -508,6 +558,7 @@ class Progress:
         self.last = -1
         self.base = base
         self.active = False
+        self.t_start = None     # restart the ETA clock for the new phase
 
     def marquee(self, note, tick, width=30, block=6):
         """Indeterminate bar: a block that bounces across the track.
