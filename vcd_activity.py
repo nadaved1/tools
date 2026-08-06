@@ -144,11 +144,14 @@ def _parse_change_bytes(s):
 # and the parent's heartbeat thread sums the slots for a smooth, chunk-spanning
 # progress bar + ETA.  Set per-process by the Pool initializer below.
 _NPROG = None
+# Optional set of in-scope identifiers (bytes) for a --scope run; None = all.
+_NFILTER = None
 
 
-def _nprog_init(arr):
-    global _NPROG
+def _nprog_init(arr, id_filter=None):
+    global _NPROG, _NFILTER
     _NPROG = arr
+    _NFILTER = id_filter
 
 
 def _native_worker(task):
@@ -195,6 +198,8 @@ def _native_worker(task):
             ident, val = _parse_change_bytes(s)
             if ident is None:
                 continue
+            if _NFILTER is not None and ident not in _NFILTER:
+                continue                             # signal outside --scope
             if no_xz and _has_xz_b(val):             # ignore x/z, keep last known
                 continue
             prev = last.get(ident)
@@ -226,7 +231,7 @@ def _align_to_hash(f, target, skip_partial):
 
 
 def run_native_parallel(path, body_start, file_size, all_ids,
-                        ncores, writer, prog, avg, no_xz):
+                        ncores, writer, prog, avg, no_xz, id_filter=None):
     total_signals = len(all_ids)
     sink = RowSink(writer, total_signals, avg, 'native')
     nchunks = ncores * 4                           # finer chunks: load balance + progress
@@ -266,8 +271,12 @@ def run_native_parallel(path, body_start, file_size, all_ids,
     hb = threading.Thread(target=heartbeat, daemon=True)
     hb.start()
 
+    # Identifiers are ASCII; workers parse bytes, so key the filter by bytes.
+    id_filter_b = (set(i.encode('ascii', 'replace') for i in id_filter)
+                   if id_filter is not None else None)
     global_state = {}
-    with Pool(ncores, initializer=_nprog_init, initargs=(arr,)) as pool:
+    with Pool(ncores, initializer=_nprog_init,
+              initargs=(arr, id_filter_b)) as pool:
         for done, (ts_order, counts, first_occ, carry_out) in enumerate(
                 pool.imap(_native_worker, tasks), 1):
             # Resolve each signal's first appearance against the carry-in state.
@@ -362,6 +371,40 @@ def parse_header(path, prog=None):
                           % (len(all_ids), nvars))
     hier = {'modules': modules, 'id2mod': id2mod}
     return all_ids, id_names, meta, hier, bytes_read, f
+
+
+def filter_scope(all_ids, hier, scope):
+    """Restrict the design to the sub-hierarchy rooted at the dotted `scope`
+    path (e.g. 'top.core.alu').  Matching is on whole path components, so
+    'top.cpu' selects 'top.cpu' and 'top.cpu.*' but never 'top.cpuX'.
+
+    Returns (ids, sub_hier) where ids is the set of identifiers declared at or
+    below the scope, and sub_hier is a {'modules', 'id2mod'} restricted to those
+    scopes (module indices re-compacted).  Returns (None, None) when nothing
+    matches, so callers can report the available scopes."""
+    scope_parts = scope.split('.')
+    modules = hier['modules']
+    id2mod = hier['id2mod']
+
+    def match(path):
+        parts = path.split('.') if path != '(top)' else ['(top)']
+        return parts[:len(scope_parts)] == scope_parts
+
+    remap = {}                                     # old module idx -> new idx
+    new_modules = []
+    for mi, path in enumerate(modules):
+        if match(path):
+            remap[mi] = len(new_modules)
+            new_modules.append(path)
+    if not new_modules:
+        return None, None
+    ids = set()
+    new_id2mod = {}
+    for ident, mi in id2mod.items():
+        if mi in remap:
+            ids.add(ident)
+            new_id2mod[ident] = remap[mi]
+    return ids, {'modules': new_modules, 'id2mod': new_id2mod}
 
 
 # --------------------------------------------------------------------------- #
@@ -664,7 +707,8 @@ class RowSink:
 # --------------------------------------------------------------------------- #
 # Mode 1: native timestamps (default)
 # --------------------------------------------------------------------------- #
-def run_native(f, bytes_read, total_size, all_ids, writer, prog, avg, no_xz):
+def run_native(f, bytes_read, total_size, all_ids, writer, prog, avg, no_xz,
+               id_filter=None):
     total_signals = len(all_ids)
     sink = RowSink(writer, total_signals, avg, 'native')
     last_val = {}
@@ -692,6 +736,8 @@ def run_native(f, bytes_read, total_size, all_ids, writer, prog, avg, no_xz):
         ident, val = parse_change(line)
         if ident is None:
             continue
+        if id_filter is not None and ident not in id_filter:
+            continue                         # signal outside --scope
         if no_xz and _has_xz(val):           # ignore x/z, keep last known value
             continue
         prev = last_val.get(ident)
@@ -712,7 +758,8 @@ def run_native(f, bytes_read, total_size, all_ids, writer, prog, avg, no_xz):
 # Mode 2: per clock cycle (--by-clock)
 # --------------------------------------------------------------------------- #
 def run_by_clock(f, bytes_read, total_size, all_ids, id_names,
-                 clock_name, edge, include_clock, writer, prog, avg, no_xz):
+                 clock_name, edge, include_clock, writer, prog, avg, no_xz,
+                 id_filter=None):
     clock_id = None
     for ident, name in id_names.items():
         if name == clock_name:
@@ -724,7 +771,11 @@ def run_by_clock(f, bytes_read, total_size, all_ids, id_names,
                          % (clock_name, names))
         sys.exit(1)
 
-    total_signals = len(all_ids) - (0 if include_clock else 1)
+    # Subtract the clock from the measured population only when it is actually
+    # part of it (it may sit outside --scope, in which case it is not counted).
+    clock_in_pop = clock_id in all_ids
+    total_signals = len(all_ids) - (1 if clock_in_pop and not include_clock
+                                    else 0)
     if total_signals <= 0:
         sys.stderr.write("error: no non-clock signals to measure.\n")
         sys.exit(1)
@@ -775,6 +826,9 @@ def run_by_clock(f, bytes_read, total_size, all_ids, id_names,
         ident, val = parse_change(line)
         if ident is None:
             continue
+        if (ident != clock_id and id_filter is not None
+                and ident not in id_filter):
+            continue                         # signal outside --scope (clock kept)
         if no_xz and _has_xz(val):           # ignore x/z, keep last known value
             continue
         prev = last_val.get(ident)
@@ -1108,6 +1162,10 @@ def main():
     ap.add_argument('vcd', help='input VCD file')
     ap.add_argument('-o', '--output',
                     help='output CSV (default: <input>.activity.csv)')
+    ap.add_argument('--scope', metavar='PATH',
+                    help='restrict the report to the sub-hierarchy rooted at '
+                         'this dotted scope path (e.g. top.core.alu); matches '
+                         'on whole path components. Default: whole design')
     ap.add_argument('--html', nargs='?', const='__AUTO__', default=None,
                     metavar='PATH',
                     help='also render a dark-themed interactive HTML graph '
@@ -1175,6 +1233,19 @@ def main():
     all_ids, id_names, meta, hier, bytes_read, f = parse_header(args.vcd, prog)
     unit = meta['timescale'] or 'time units'
 
+    # --scope: narrow the population (and the hierarchy view) to a sub-tree.
+    id_filter = None
+    if args.scope:
+        id_filter, sub_hier = filter_scope(all_ids, hier, args.scope)
+        if id_filter is None:
+            avail = '\n  '.join(hier['modules']) or '(none)'
+            sys.stderr.write("error: scope %r matched no signals. "
+                             "Available scopes:\n  %s\n"
+                             % (args.scope, avail))
+            sys.exit(1)
+        all_ids = id_filter            # measured population is now the sub-tree
+        hier = sub_hier                # hierarchy / heatmap follow the scope
+
     out = open(out_path, 'w', newline='')
     writer = csv.writer(out)
 
@@ -1193,7 +1264,7 @@ def main():
         rows, total_signals = run_by_clock(
             f, bytes_read, total_size, all_ids, id_names,
             args.clock, args.edge, args.include_clock, writer, prog, args.avg,
-            args.no_xz)
+            args.no_xz, id_filter)
         xlabel = 'time (%s) - cycle start' % unit
         if args.avg > 1:
             subtitle = ('%d signals (clock %r excluded) | %d points '
@@ -1208,11 +1279,11 @@ def main():
             f.close()
             rows, total_signals = run_native_parallel(
                 args.vcd, bytes_read, total_size, all_ids,
-                args.ncores, writer, prog, args.avg, args.no_xz)
+                args.ncores, writer, prog, args.avg, args.no_xz, id_filter)
         else:
             rows, total_signals = run_native(
                 f, bytes_read, total_size, all_ids, writer, prog, args.avg,
-                args.no_xz)
+                args.no_xz, id_filter)
         xlabel = 'time (%s)' % unit
         if args.avg > 1:
             subtitle = ('%d signals | %d points (mean of %d timestamps each)'
@@ -1221,6 +1292,8 @@ def main():
             subtitle = ('%d signals | %d native timestamps'
                         % (total_signals, rows))
 
+    if args.scope:
+        subtitle += ' | scope: %s' % args.scope
     if args.no_xz:
         subtitle += ' | x/z transitions ignored'
     if is_gz:
