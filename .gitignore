@@ -5,3 +5,6 @@ __pycache__/
 *.activity.html
 datapath_activity.csv
 make_big_vcd.py
+*.fsdb
+fsdb_activity/fsdb_activity
+fsdb_activityLog/

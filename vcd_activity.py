@@ -13,16 +13,24 @@ large traces.  The only state kept in memory is the last value of each signal,
 which is bounded by the number of signals in the design - not by the length of
 the simulation.
 
+An FSDB (.fsdb) can be given instead of a VCD: it is read directly through
+Synopsys NPI by the fsdb_activity helper (see fsdb_activity/README.md), so no
+fsdb2vcd conversion is needed.
+
 Usage:
     python vcd_activity.py trace.vcd                         # -> trace.activity.csv
     python vcd_activity.py trace.vcd --html                  # + trace.activity.html
     python vcd_activity.py trace.vcd --by-clock --clock clk
+    python vcd_activity.py trace.fsdb --html                 # FSDB via NPI
 """
 
 import argparse
 import gzip
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import csv
 import json
 import time
@@ -235,13 +243,15 @@ def _align_to_hash(f, target, skip_partial):
 
 
 def _chunk_starts(path, body_start, file_size, nchunks):
-    """'#'-aligned chunk start offsets over the body, ascending.  Empty when the
-    body has no timestamp line at all (callers then have nothing to parse)."""
+    """Chunk start offsets over the body, ascending; all but the first are
+    '#'-aligned.  The first starts at the body itself, not its first '#', so
+    initial values written before any timestamp (fsdb2vcd emits $dumpvars with
+    no leading #0) are seen.  Empty when the body has no timestamp line at all
+    (callers then have nothing to parse)."""
     with open(path, 'rb') as f:
-        first = _align_to_hash(f, body_start, False)   # first chunk starts at '#0'
-        if first is None:
+        if _align_to_hash(f, body_start, False) is None:
             return []
-        starts = [first]
+        starts = [body_start]
         span = file_size - body_start
         for i in range(1, nchunks):
             off = _align_to_hash(f, body_start + span * i // nchunks, True)
@@ -266,7 +276,7 @@ def run_native_parallel(path, body_start, file_size, all_ids,
     # thread sums the slots ~4x/s so the bar (and ETA) move smoothly within a
     # chunk, not just once per chunk completion.
     arr = Array('q', ntasks or 1, lock=False)
-    body_bytes = max(1, file_size - (starts[0] if starts else body_start))
+    body_bytes = max(1, file_size - body_start)
     state = {'rows': 0, 'chunks': 0}
     stop = threading.Event()
 
@@ -344,6 +354,12 @@ def parse_header(path, prog=None):
             continue
         if line.startswith('$var'):
             parts = line.split()             # $var <type> <size> <id> <name> ...
+            if len(parts) < 5:
+                if not raw.endswith(b'\n'):  # file cut mid-line: truncated
+                    break
+                f.close()
+                raise VCDFormatError('malformed $var line after %d bytes: %r'
+                                     % (bytes_read - len(raw), line[:200]))
             ident, name = parts[3], parts[4]
             all_ids.add(ident)
             id_names.setdefault(ident, name)
@@ -937,7 +953,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div><span class="k">Dumped by</span><span class="v">{m_tool}</span></div>
     <div><span class="k">Dump date</span><span class="v">{m_date}</span></div>
     <div><span class="k">Timescale</span><span class="v">{m_scale}</span></div>
-    <div><span class="k">VCD size</span><span class="v">{m_size}</span></div>
+    <div><span class="k">Input size</span><span class="v">{m_size}</span></div>
   </div>
   <div id="chart"></div>
   {hierarchy}
@@ -1174,11 +1190,196 @@ def render_html(csv_path, html_path, title, subtitle, xlabel, generated,
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# FSDB input: delegate the waveform walk to the NPI-based fsdb_activity helper
+# --------------------------------------------------------------------------- #
+def _is_fsdb(path):
+    return path.lower().endswith('.fsdb')
+
+
+def _find_fsdb_reader(explicit):
+    """Path of the fsdb_activity helper, or None.  Order: --fsdb-reader,
+    $FSDB_ACTIVITY, next to this script (fsdb_activity/ or flat), $PATH."""
+    if explicit:
+        return explicit if os.access(explicit, os.X_OK) else None
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands = [os.environ.get('FSDB_ACTIVITY'),
+             os.path.join(here, 'fsdb_activity', 'fsdb_activity'),
+             os.path.join(here, 'fsdb_activity'),
+             shutil.which('fsdb_activity')]
+    for c in cands:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def run_fsdb(args, t0):
+    """Native-mode report for an FSDB: the helper emits per-timestamp change
+    counts, which go through the same RowSink / HTML path as a VCD."""
+    unsupported = [flag for flag, on in (('--by-clock', args.by_clock),)
+                   if on]
+    if unsupported:
+        sys.stderr.write('error: %s is not supported for FSDB input yet; '
+                         'convert to VCD for that mode.\n'
+                         % ', '.join(unsupported))
+        sys.exit(1)
+    reader = _find_fsdb_reader(args.fsdb_reader)
+    if reader is None:
+        sys.stderr.write(
+            'error: FSDB input needs the fsdb_activity helper, which was not '
+            'found (looked at --fsdb-reader, $FSDB_ACTIVITY, next to this '
+            'script and on $PATH).  Build it with:\n'
+            '  cd fsdb_activity && make VERDI_HOME=$VERDI_HOME\n')
+        sys.exit(1)
+
+    # absolute paths: each worker runs in its own directory (see below)
+    cmd = [os.path.abspath(reader), os.path.abspath(args.vcd)]
+    if args.scope:
+        cmd += ['--scope', args.scope]
+    if args.no_xz:
+        cmd.append('--no-xz')
+    nparts = max(1, args.ncores)
+    if nparts > 1:
+        sys.stderr.write('note: reading the FSDB with %d NPI processes (each '
+                         'checks out its own Verdi license and opens the FSDB '
+                         'itself).\n' % nparts)
+
+    base = os.path.splitext(args.vcd)[0]
+    out_path = args.output or (base + '.activity.csv')
+    ncol = 'avg_signals_changed' if args.avg > 1 else 'signals_changed'
+    meta = {'date': '', 'version': 'FSDB (read via NPI)', 'timescale': ''}
+
+    # Each worker reads the signals of its share of scope blocks (--part k/N)
+    # and writes per-timestamp counts; counts are per signal, so the shares
+    # (and the signal totals) just add up.  Every worker runs in its own
+    # directory: NPI writes a log dir into the cwd, and workers sharing one
+    # were measured ~5x slower.  Worker 0 shows progress; the others' stderr
+    # is kept for error reports.
+    with tempfile.TemporaryDirectory(prefix='fsdb_activity.') as tmp:
+        procs = []
+        for k in range(nparts):
+            wcmd = list(cmd)
+            if nparts > 1:
+                wcmd += ['--part', '%d/%d' % (k, nparts)]
+            if args.no_progress or k > 0:
+                wcmd.append('--no-progress')
+            wdir = os.path.join(tmp, 'w%d' % k)
+            os.mkdir(wdir)
+            outf = open(os.path.join(tmp, 'part%d.out' % k), 'w')
+            errf = None if k == 0 else open(os.path.join(tmp, 'part%d.err' % k),
+                                            'w')
+            procs.append((subprocess.Popen(wcmd, stdout=outf, stderr=errf,
+                                           cwd=wdir),
+                          outf, errf))
+        failed = None
+        running = set(range(nparts))
+        while running and failed is None:      # first failure stops them all
+            for k in sorted(running):
+                rc = procs[k][0].poll()
+                if rc is None:
+                    continue
+                running.discard(k)
+                if rc != 0:
+                    failed = (k, rc)
+                    break
+            if running and failed is None:
+                time.sleep(0.5)
+        for p, outf, errf in procs:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+            outf.close()
+            if errf:
+                errf.close()
+        if failed is not None:
+            k, rc = failed
+            if k > 0:
+                with open(os.path.join(tmp, 'part%d.err' % k)) as fh:
+                    lines = [l for l in fh.read().splitlines()
+                             if l.startswith('error')]
+                sys.stderr.write('\n'.join(lines[-5:]) + '\n' if lines else '')
+            if rc < 0:
+                sys.stderr.write('error: fsdb_activity worker %d was killed by '
+                                 'signal %d; no report written.\n' % (k, -rc))
+            sys.exit(rc if rc > 0 else 1)
+
+        counts = {}
+        total_signals = 0
+        for k in range(nparts):
+            ended = False
+            nsig = None
+            with open(os.path.join(tmp, 'part%d.out' % k)) as fh:
+                for line in fh:
+                    parts = line.split()
+                    if not parts or parts[0].startswith('#'):
+                        continue
+                    key = parts[0]
+                    if key == 'timescale':
+                        meta['timescale'] = ' '.join(parts[1:])
+                    elif key == 'signals':
+                        nsig = int(parts[1])
+                    elif key == 'end':
+                        ended = True
+                    else:
+                        t = int(key)
+                        counts[t] = counts.get(t, 0) + int(parts[1])
+            if not ended or nsig is None:
+                sys.stderr.write('error: fsdb_activity worker %d output was '
+                                 'incomplete; no report written.\n' % k)
+                sys.exit(1)
+            total_signals += nsig
+    if total_signals == 0:             # only possible when split across workers
+        sys.stderr.write('error: no signals found%s\n'
+                         % (' under --scope' if args.scope else ''))
+        sys.exit(4)
+
+    with open(out_path, 'w', newline='') as out:
+        writer = csv.writer(out)
+        writer.writerow(['time', ncol, 'total_signals', 'percent_changed'])
+        sink = RowSink(writer, total_signals, args.avg, 'native')
+        for t in sorted(counts):
+            sink.add_native(t, counts[t])
+        sink.flush()
+    rows = sink.rows
+    if rows == 0:
+        sys.stderr.write('error: the FSDB has no value changes%s.\n'
+                         % (' under --scope' if args.scope else ''))
+        sys.exit(1)
+
+    unit = meta['timescale'] or 'time units'
+    if args.avg > 1:
+        subtitle = ('%d signals | %d points (mean of %d timestamps each)'
+                    % (total_signals, rows, args.avg))
+    else:
+        subtitle = '%d signals | %d FSDB timestamps' % (total_signals, rows)
+    if args.scope:
+        subtitle += ' | scope: %s' % args.scope
+    if args.no_xz:
+        subtitle += ' | x/z transitions ignored'
+    subtitle += ' | FSDB input'
+
+    if args.html is not None:
+        html_path = (base + '.activity.html') if args.html == '__AUTO__' \
+            else args.html
+        title = 'FSDB switching activity - %s' % os.path.basename(args.vcd)
+        generated = datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')
+        # No hierarchy / similarity overlay for FSDB input (yet).
+        render_html(out_path, html_path, title, subtitle, 'time (%s)' % unit,
+                    generated, args.max_points, meta,
+                    os.path.getsize(args.vcd) or 1, None, None)
+        sys.stderr.write('html: %s\n' % html_path)
+
+    sys.stderr.write('done: signals=%d  rows=%d  time=%s  -> %s\n'
+                     % (total_signals, rows,
+                        human_time(time.perf_counter() - t0), out_path))
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Per-time-unit (or per-clock) signal switching activity "
                     "from a VCD file.")
-    ap.add_argument('vcd', help='input VCD file')
+    ap.add_argument('vcd', help='input VCD file (.vcd, .vcd.gz) or FSDB '
+                                '(.fsdb, read via the fsdb_activity helper)')
     ap.add_argument('-o', '--output',
                     help='output CSV (default: <input>.activity.csv)')
     ap.add_argument('--scope', metavar='PATH',
@@ -1223,15 +1424,24 @@ def main():
                          'activity (the last defined value is retained)')
     ap.add_argument('--ncores', type=int, default=1, metavar='N',
                     help='parse on N worker processes (native mode only); '
-                         '0 = all available cores')
+                         '0 = all available cores.  For FSDB input each '
+                         'worker is an NPI process with its own Verdi license '
+                         'and hierarchy copy')
     ap.add_argument('--no-progress', action='store_true',
                     help='disable the progress indicator')
+    ap.add_argument('--fsdb-reader', metavar='PATH',
+                    help='fsdb_activity helper for .fsdb input (default: '
+                         '$FSDB_ACTIVITY, next to this script, or $PATH)')
     args = ap.parse_args()
 
     if args.ncores == 0:
         args.ncores = os.cpu_count() or 1
     if args.avg < 1:
         args.avg = 1
+
+    if _is_fsdb(args.vcd):
+        run_fsdb(args, time.perf_counter())
+        return
 
     is_gz = _is_gzip(args.vcd)
     if is_gz and args.ncores > 1:
