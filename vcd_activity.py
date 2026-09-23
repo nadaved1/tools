@@ -57,6 +57,10 @@ def parse_change(line):
 # --------------------------------------------------------------------------- #
 # Input helpers: transparent gzip + x/z filtering
 # --------------------------------------------------------------------------- #
+class VCDFormatError(Exception):
+    """The VCD is structurally unusable (e.g. truncated); message is for users."""
+
+
 def _is_gzip(path):
     """True if path is gzip-compressed (sniffed by magic bytes, not extension)."""
     try:
@@ -230,21 +234,29 @@ def _align_to_hash(f, target, skip_partial):
             return pos
 
 
+def _chunk_starts(path, body_start, file_size, nchunks):
+    """'#'-aligned chunk start offsets over the body, ascending.  Empty when the
+    body has no timestamp line at all (callers then have nothing to parse)."""
+    with open(path, 'rb') as f:
+        first = _align_to_hash(f, body_start, False)   # first chunk starts at '#0'
+        if first is None:
+            return []
+        starts = [first]
+        span = file_size - body_start
+        for i in range(1, nchunks):
+            off = _align_to_hash(f, body_start + span * i // nchunks, True)
+            if off is not None and off > starts[-1]:
+                starts.append(off)
+    return starts
+
+
 def run_native_parallel(path, body_start, file_size, all_ids,
                         ncores, writer, prog, avg, no_xz, id_filter=None):
     total_signals = len(all_ids)
     sink = RowSink(writer, total_signals, avg, 'native')
     nchunks = ncores * 4                           # finer chunks: load balance + progress
 
-    # Build '#'-aligned chunk boundaries.
-    with open(path, 'rb') as f:
-        starts = [_align_to_hash(f, 0, False)]     # first chunk starts at '#0'
-        span = file_size - body_start
-        for i in range(1, nchunks):
-            off = _align_to_hash(f, body_start + span * i // nchunks, True)
-            if off is not None and off > starts[-1]:
-                starts.append(off)
-    starts = [s for s in starts if s is not None]
+    starts = _chunk_starts(path, body_start, file_size, nchunks)
     ends = starts[1:] + [file_size]
     pairs = [(st, en) for st, en in zip(starts, ends) if st < en]
     tasks = [(path, i, st, en, no_xz) for i, (st, en) in enumerate(pairs)]
@@ -254,7 +266,7 @@ def run_native_parallel(path, body_start, file_size, all_ids,
     # thread sums the slots ~4x/s so the bar (and ETA) move smoothly within a
     # chunk, not just once per chunk completion.
     arr = Array('q', ntasks or 1, lock=False)
-    body_bytes = max(1, file_size - starts[0])
+    body_bytes = max(1, file_size - (starts[0] if starts else body_start))
     state = {'rows': 0, 'chunks': 0}
     stop = threading.Event()
 
@@ -313,6 +325,7 @@ def parse_header(path, prog=None):
     nvars = 0
     hdr_tick = 0
     pending = None                            # multi-line field being collected
+    complete = False                          # saw $enddefinitions
 
     f = _open(path)
     for raw in f:
@@ -365,10 +378,21 @@ def parse_header(path, prog=None):
                 meta[name] = rest.strip()
                 pending = name
         elif line.startswith('$enddefinitions'):
+            complete = True
             break
     if prog is not None:
         prog.marquee_done('reading header: %d signals (%d vars)'
                           % (len(all_ids), nvars))
+    if not complete:
+        f.close()
+        raise VCDFormatError(
+            'VCD header is truncated: end of file reached after %d bytes '
+            '(%d $var lines, last scope %r) without $enddefinitions, so the '
+            'file has no value-change data.  The tool that wrote it (e.g. '
+            'fsdb2vcd) most likely stopped early - check its log and exit '
+            'status, disk quota and file-size limits (ulimit -f, LSF -F), or '
+            're-convert a smaller scope / time window.'
+            % (bytes_read, nvars, '.'.join(scope) or '(top)'))
     hier = {'modules': modules, 'id2mod': id2mod}
     return all_ids, id_names, meta, hier, bytes_read, f
 
@@ -509,19 +533,14 @@ def collect_module_activity(path, body_start, file_size, hier, nbins,
     nmods = len(hier['modules'])
     tspan = max(1, tmax - tmin + 1)
     nchunks = max(1, ncores * 4)
-    with open(path, 'rb') as f:
-        starts = [_align_to_hash(f, 0, False)]
-        span = file_size - body_start
-        for i in range(1, nchunks):
-            off = _align_to_hash(f, body_start + span * i // nchunks, True)
-            if off is not None and off > starts[-1]:
-                starts.append(off)
-    starts = [s for s in starts if s is not None]
+    starts = _chunk_starts(path, body_start, file_size, nchunks)
     ends = starts[1:] + [file_size]
     tasks = [(path, st, en) for st, en in zip(starts, ends) if st < en]
 
     M = [[0] * nmods for _ in range(nbins)]
     ntasks = len(tasks)
+    if not ntasks:
+        return M
     with Pool(ncores, initializer=_hm_init,
               initargs=(id2mod, nbins, tmin, tspan, nmods, no_xz)) as pool:
         for done, counts in enumerate(
@@ -1230,7 +1249,12 @@ def main():
     out_path = args.output or (base + '.activity.csv')
 
     prog = Progress(total_size, not args.no_progress)
-    all_ids, id_names, meta, hier, bytes_read, f = parse_header(args.vcd, prog)
+    try:
+        all_ids, id_names, meta, hier, bytes_read, f = parse_header(args.vcd,
+                                                                    prog)
+    except VCDFormatError as e:
+        sys.stderr.write('error: %s\n' % e)
+        sys.exit(1)
     unit = meta['timescale'] or 'time units'
 
     # --scope: narrow the population (and the hierarchy view) to a sub-tree.
@@ -1302,6 +1326,13 @@ def main():
     if not f.closed:
         f.close()
     out.close()
+
+    if rows == 0:
+        sys.stderr.write('error: no timestamp lines (#<time>) after the VCD '
+                         'header, so there is no value-change data to '
+                         'measure.  The file is empty past $enddefinitions '
+                         '(or was cut off right after it).\n')
+        sys.exit(1)
 
     # ---- region analysis (active-set similarity overlay), HTML only --------
     # This pass feeds the optional similarity overlay AND the hierarchy heatmap,
