@@ -24,6 +24,10 @@ else
   $(error set VERDI_HOME (Verdi install) or FSDB_PLUS_HOME (FSDB+ SDK))
 endif
 
+# NPI needs librt on older glibc (e.g. SLES15), where it is not part of libc.
+# Thanks to hagay.spector for finding and fixing this.
+LIBS += -lrt
+
 fsdb_activity: fsdb_activity.cpp
 	$(CXX) $(CXXFLAGS) $(DEFS) -DNPI_LIBDIR='"$(NPI_LIB)"' -I$(NPI_INC) $< -o $@ \
 	    -L$(NPI_LIB) -Wl,-rpath,$(NPI_LIB) $(LIBS)
