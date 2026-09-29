@@ -39,7 +39,24 @@ every N-th block of 16 scopes, and the per-timestamp counts are summed. NPI
 decoding is single-threaded, so this is where the speed comes from, but **each
 worker checks out its own Verdi license and opens the FSDB itself** (about
 25 GB and a minute per open on a 557M-signal chip with Verdi 2017), so size N
-to the free licenses and memory.
+to the free licenses. `--ncores` is capped to the cores the job may use (CPU
+affinity and cgroup quota).
+
+## Memory
+
+NPI frees nothing a process allocated for the signals it has read - neither
+the signal handles nor the value changes, even after they are unloaded - until
+that process closes the FSDB. A worker therefore only grows, by roughly the
+signals it has read times a per-signal cost, and only exiting hands it back.
+
+`vcd_activity.py` handles this without any option: it detects the memory the
+job may use (the tightest of the cgroup limit, `RLIMIT_AS` and `MemAvailable`,
+less 20%) and gives each concurrent worker an equal share as `--max-rss`. A
+worker that would pass its ceiling stops at the next block of 16 scopes,
+reports the counts it has, and its share continues in a fresh process from
+that block (`--start-block`). Designs that fit never restart. If opening the
+FSDB alone takes most of a worker's ceiling, fewer workers run at a time; if
+it does not fit even alone, the run stops and says how much memory it needs.
 
 ## Semantics
 
@@ -59,12 +76,17 @@ FSDB does not store the information:
 ## Standalone output
 
 ```
-# fsdb_activity 1
+# fsdb_activity 2
 timescale 1ps
+open_rss 96           # MB resident right after opening the FSDB
 signals 200000
 <time> <count>        # ascending
+resume 1234           # only when --max-rss stopped it early
 end
 ```
+
+Options for use on its own: `--scope a.b.c`, `--no-xz`, `--part K/N`,
+`--start-block B`, `--max-rss MB`, `--batch N`, `--no-progress`.
 
 Progress and NPI banners go to stderr. Exit codes: 2 usage, 3 open / license
 failure, 4 no signals (e.g. `--scope` matched nothing).

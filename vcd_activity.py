@@ -26,6 +26,8 @@ Usage:
 
 import argparse
 import gzip
+import heapq
+import itertools
 import os
 import shutil
 import subprocess
@@ -971,34 +973,55 @@ _REGIME_COLORS = ['#1f6feb', '#8957e5', '#238636', '#9e6a03',
                   '#bc4c00', '#1b7c83', '#a371f7', '#57606a']
 
 
-def _decimate(xs, ys, max_points):
-    """Down-sample (xs, ys) for display, keeping the min AND max of each bucket.
+def _read_decimated(csv_path, max_points):
+    """Read a report CSV's (x, percent_changed) series for display, down-
+    sampled to keep the min AND max of each bucket.  Returns (xs, ys, total).
 
     Inlining millions of points makes the HTML huge and the browser choke.
     Bucketing into ~max_points/2 ranges and emitting each bucket's lowest and
     highest sample (in time order) preserves the visual envelope - activity
-    spikes are never dropped - while bounding the embedded data.
+    spikes are never dropped - while bounding the embedded data.  The CSV is
+    streamed twice (count, then bucket), so memory follows max_points rather
+    than the length of the trace.
     """
-    n = len(xs)
-    if max_points <= 0 or n <= max_points:
-        return xs, ys, n
-    nb = max(1, max_points // 2)
-    ox, oy = [], []
-    for b in range(nb):
-        lo = (b * n) // nb
-        hi = ((b + 1) * n) // nb
-        if hi <= lo:
-            continue
-        imin = imax = lo
-        for i in range(lo + 1, hi):
-            if ys[i] < ys[imin]:
-                imin = i
-            elif ys[i] > ys[imax]:
-                imax = i
-        a, c = (imin, imax) if imin <= imax else (imax, imin)
-        ox.append(xs[a]); oy.append(ys[a])
-        if c != a:
-            ox.append(xs[c]); oy.append(ys[c])
+    with open(csv_path, newline='') as fh:
+        n = max(0, sum(1 for _ in fh) - 1)          # minus the header row
+    with open(csv_path, newline='') as fh:
+        r = csv.DictReader(fh)
+        xcol = 'time' if 'time' in r.fieldnames else 'start_time'
+        if max_points <= 0 or n <= max_points:
+            xs, ys = [], []
+            for row in r:
+                xs.append(int(row[xcol]))
+                ys.append(float(row['percent_changed']))
+            return xs, ys, len(xs)
+        nb = max(1, max_points // 2)
+        ox, oy = [], []
+
+        def emit(bk):
+            if bk is None:
+                return
+            lo_i, lo_x, lo_y, hi_i, hi_x, hi_y = bk
+            first, second = ((lo_x, lo_y), (hi_x, hi_y)) if lo_i <= hi_i \
+                else ((hi_x, hi_y), (lo_x, lo_y))
+            ox.append(first[0]); oy.append(first[1])
+            if lo_i != hi_i:
+                ox.append(second[0]); oy.append(second[1])
+
+        b, end, bk = 0, n // nb, None       # bucket b holds rows [.., end)
+        for i, row in enumerate(r):
+            while i >= end:
+                emit(bk)
+                b, bk = b + 1, None
+                end = ((b + 1) * n) // nb
+            x, y = int(row[xcol]), float(row['percent_changed'])
+            if bk is None:
+                bk = [i, x, y, i, x, y]
+            elif y < bk[2]:
+                bk[0:3] = [i, x, y]
+            elif y > bk[5]:
+                bk[3:6] = [i, x, y]
+        emit(bk)
     return ox, oy, n
 
 
@@ -1112,14 +1135,7 @@ def render_hierarchy_html(hier, esc, mod_tot=None):
 
 def render_html(csv_path, html_path, title, subtitle, xlabel, generated,
                 max_points, meta, vcd_size, region=None, hier=None):
-    xs, ys = [], []
-    with open(csv_path, newline='') as fh:
-        r = csv.DictReader(fh)
-        xcol = 'time' if 'time' in r.fieldnames else 'start_time'
-        for row in r:
-            xs.append(int(row[xcol]))
-            ys.append(float(row['percent_changed']))
-    xs, ys, total = _decimate(xs, ys, max_points)
+    xs, ys, total = _read_decimated(csv_path, max_points)
     if len(xs) < total:
         subtitle += (' | plotted %s of %s points (min/max decimated)'
                      % (f'{len(xs):,}', f'{total:,}'))
@@ -1213,6 +1229,145 @@ def _find_fsdb_reader(explicit):
     return None
 
 
+def _read_int(path):
+    try:
+        with open(path) as fh:
+            v = fh.read().strip()
+    except OSError:
+        return None
+    return int(v) if v.lstrip('-').isdigit() else None     # 'max' -> None
+
+
+def _cgroup_dirs(v1_controller):
+    """This process's cgroup directories for a controller, innermost first:
+    the v2 unified tree plus the v1 tree of `v1_controller`.  Inside a
+    container the listed path may not exist under the mount, so each tree's
+    root is tried too."""
+    try:
+        with open('/proc/self/cgroup') as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return []
+    dirs = []
+    for line in lines:
+        parts = line.split(':', 2)
+        if len(parts) != 3:
+            continue
+        if parts[1] == '':
+            root = '/sys/fs/cgroup'
+        elif v1_controller in parts[1].split(','):
+            root = '/sys/fs/cgroup/' + v1_controller
+        else:
+            continue
+        p = parts[2]
+        while True:
+            dirs.append(root + p.rstrip('/'))
+            if p in ('/', ''):
+                break
+            p = os.path.dirname(p)
+    return [d for d in dirs if os.path.isdir(d)]
+
+
+def _memory_budget():
+    """Bytes this job may use, or None: the tightest of the cgroup memory
+    limits, the address-space rlimit and MemAvailable."""
+    lims = []
+    for d in _cgroup_dirs('memory'):
+        for name in ('memory.max', 'memory.limit_in_bytes'):
+            v = _read_int(os.path.join(d, name))
+            if v and v < 1 << 60:                       # else "unlimited"
+                lims.append(v)
+    try:
+        import resource
+        soft = resource.getrlimit(resource.RLIMIT_AS)[0]
+        if soft != resource.RLIM_INFINITY:
+            lims.append(soft)
+    except (ImportError, ValueError, OSError):
+        pass
+    try:
+        with open('/proc/meminfo') as fh:
+            for line in fh:
+                if line.startswith('MemAvailable:'):
+                    lims.append(int(line.split()[1]) * 1024)
+    except (OSError, ValueError, IndexError):
+        pass
+    return min(lims) if lims else None
+
+
+def _available_cores():
+    """CPUs this process may run on: its affinity mask, capped by any cgroup
+    CPU quota."""
+    try:
+        n = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        n = os.cpu_count() or 1
+    for d in _cgroup_dirs('cpu'):
+        quota = period = None
+        try:
+            with open(os.path.join(d, 'cpu.max')) as fh:        # v2
+                q, p = fh.read().split()
+            if q != 'max':
+                quota, period = int(q), int(p)
+        except (OSError, ValueError):
+            quota = _read_int(os.path.join(d, 'cpu.cfs_quota_us'))   # v1
+            period = _read_int(os.path.join(d, 'cpu.cfs_period_us'))
+        if quota and quota > 0 and period:
+            n = min(n, max(1, -(-quota // period)))
+    return max(1, n)
+
+
+def _parse_mem(s):
+    """'64G', '512M', '1.5T' or plain bytes -> bytes (for --mem-limit)."""
+    s = s.strip().upper().rstrip('B')
+    mult = {'K': 1 << 10, 'M': 1 << 20, 'G': 1 << 30, 'T': 1 << 40}
+    try:
+        if s and s[-1] in mult:
+            return int(float(s[:-1]) * mult[s[-1]])
+        return int(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError('expected a size like 64G or 512M')
+
+
+def _fsdb_part_header(fh):
+    """Read a helper output's header lines; returns (timescale, open_rss_mb,
+    signals) and leaves fh at the first data row."""
+    ts, open_rss, nsig = '', 0, None
+    for line in fh:
+        parts = line.split()
+        if not parts or parts[0].startswith('#'):
+            continue
+        if parts[0] == 'timescale':
+            ts = ' '.join(parts[1:])
+        elif parts[0] == 'open_rss':
+            open_rss = int(parts[1])
+        elif parts[0] == 'signals':
+            nsig = int(parts[1])
+            break
+    return ts, open_rss, nsig
+
+
+def _fsdb_part_rows(fh):
+    """(time, count) rows of a helper output, ascending, up to its trailer."""
+    for line in fh:
+        parts = line.split()
+        if parts[0] in ('resume', 'end'):
+            return
+        yield int(parts[0]), int(parts[1])
+
+
+def _fsdb_part_trailer(path):
+    """(complete, resume_block) from the last lines of a helper output."""
+    with open(path, 'rb') as fh:
+        fh.seek(max(0, os.path.getsize(path) - 64))
+        tail = fh.read().split(b'\n')
+    words = [l.split() for l in tail if l.strip()]
+    if not words or words[-1] != [b'end']:
+        return False, None
+    if len(words) >= 2 and words[-2][:1] == [b'resume']:
+        return True, int(words[-2][1])
+    return True, None
+
+
 def run_fsdb(args, t0):
     """Native-mode report for an FSDB: the helper emits per-timestamp change
     counts, which go through the same RowSink / HTML path as a VCD."""
@@ -1244,6 +1399,19 @@ def run_fsdb(args, t0):
                          'checks out its own Verdi license and opens the FSDB '
                          'itself).\n' % nparts)
 
+    # Memory.  NPI frees nothing a process allocated for the signals it read
+    # until that process exits, so each helper gets a ceiling (--max-rss): at
+    # the first scope-block boundary where it would pass it, it reports what
+    # it has and exits, and its share continues in a fresh process from that
+    # block.  Small designs never hit the ceiling and pay nothing for this.
+    budget = args.mem_limit or _memory_budget()
+    budget_mb = int(budget * 0.8) >> 20 if budget else 0
+    if budget_mb:
+        sys.stderr.write('note: memory budget %s (%s)\n'
+                         % (human_size(budget_mb << 20),
+                            '--mem-limit' if args.mem_limit
+                            else 'detected, less 20% headroom'))
+
     base = os.path.splitext(args.vcd)[0]
     out_path = args.output or (base + '.activity.csv')
     ncol = 'avg_signals_changed' if args.avg > 1 else 'signals_changed'
@@ -1251,40 +1419,88 @@ def run_fsdb(args, t0):
 
     # Each worker reads the signals of its share of scope blocks (--part k/N)
     # and writes per-timestamp counts; counts are per signal, so the shares
-    # (and the signal totals) just add up.  Every worker runs in its own
+    # (and the signal totals) just add up.  Every process runs in its own
     # directory: NPI writes a log dir into the cwd, and workers sharing one
-    # were measured ~5x slower.  Worker 0 shows progress; the others' stderr
+    # were measured ~5x slower.  Part 0 shows progress; the others' stderr
     # is kept for error reports.
     with tempfile.TemporaryDirectory(prefix='fsdb_activity.') as tmp:
-        procs = []
-        for k in range(nparts):
-            wcmd = list(cmd)
-            if nparts > 1:
-                wcmd += ['--part', '%d/%d' % (k, nparts)]
-            if args.no_progress or k > 0:
-                wcmd.append('--no-progress')
-            wdir = os.path.join(tmp, 'w%d' % k)
-            os.mkdir(wdir)
-            outf = open(os.path.join(tmp, 'part%d.out' % k), 'w')
-            errf = None if k == 0 else open(os.path.join(tmp, 'part%d.err' % k),
-                                            'w')
-            procs.append((subprocess.Popen(wcmd, stdout=outf, stderr=errf,
-                                           cwd=wdir),
-                          outf, errf))
+        queue = [(k, 0) for k in range(nparts)]     # (part, start block)
+        active = nparts                             # concurrent processes
+        running = {}                                # seg -> (proc, part, ...)
+        outputs = []
+        nseg = 0
         failed = None
-        running = set(range(nparts))
-        while running and failed is None:      # first failure stops them all
-            for k in sorted(running):
-                rc = procs[k][0].poll()
+        while (queue or running) and failed is None:
+            while queue and len(running) < active:
+                k, block = queue.pop(0)
+                cap_mb = budget_mb // active if budget_mb else 0
+                wcmd = list(cmd)
+                if nparts > 1:
+                    wcmd += ['--part', '%d/%d' % (k, nparts)]
+                if block:
+                    wcmd += ['--start-block', str(block)]
+                if cap_mb:
+                    wcmd += ['--max-rss', str(cap_mb)]
+                if args.no_progress or k > 0:
+                    wcmd.append('--no-progress')
+                wdir = os.path.join(tmp, 'w%d' % nseg)
+                os.mkdir(wdir)
+                out_file = os.path.join(tmp, 'seg%d.out' % nseg)
+                err_file = None if k == 0 and not args.no_progress else \
+                    os.path.join(tmp, 'seg%d.err' % nseg)
+                outf = open(out_file, 'w')
+                errf = open(err_file, 'w') if err_file else None
+                running[nseg] = (subprocess.Popen(wcmd, stdout=outf,
+                                                  stderr=errf, cwd=wdir),
+                                 k, out_file, err_file, outf, errf, cap_mb)
+                nseg += 1
+            for seg in sorted(running):
+                p, k, out_file, err_file, outf, errf, cap_mb = running[seg]
+                rc = p.poll()
                 if rc is None:
                     continue
-                running.discard(k)
+                del running[seg]
+                outf.close()
+                if errf:
+                    errf.close()
                 if rc != 0:
-                    failed = (k, rc)
+                    failed = (k, rc, err_file)
                     break
-            if running and failed is None:
+                complete, resume = _fsdb_part_trailer(out_file)
+                if not complete:
+                    failed = (k, 'incomplete', err_file)
+                    break
+                outputs.append(out_file)
+                if resume is None:
+                    continue
+                queue.append((k, resume))
+                with open(out_file) as fh:
+                    open_rss = _fsdb_part_header(fh)[1]
+                if k == 0 and not args.no_progress:
+                    sys.stderr.write('\n')
+                sys.stderr.write('note: worker %d reached its %s memory '
+                                 'ceiling; continuing from scope block %d in '
+                                 'a fresh process\n'
+                                 % (k, human_size(cap_mb << 20), resume))
+                # Opening the FSDB is a fixed cost per process.  If it eats
+                # most of a process's ceiling, every restart gets little done:
+                # run fewer processes at a time, each with more room.  Only
+                # processes started under the current setting count; ones
+                # still finishing under an older, smaller ceiling do not.
+                if cap_mb >= budget_mb // active and open_rss * 2 > cap_mb:
+                    if active > 1:
+                        active = max(1, active // 2)
+                        sys.stderr.write('note: opening the FSDB takes %s of '
+                                         'a %s ceiling; running %d NPI '
+                                         'process(es) at a time instead\n'
+                                         % (human_size(open_rss << 20),
+                                            human_size(cap_mb << 20), active))
+                    else:
+                        failed = (k, 'memory', open_rss)
+                        break
+            if (queue or running) and failed is None:
                 time.sleep(0.5)
-        for p, outf, errf in procs:
+        for p, k, out_file, err_file, outf, errf, cap_mb in running.values():
             if p.poll() is None:
                 p.kill()
                 p.wait()
@@ -1292,54 +1508,58 @@ def run_fsdb(args, t0):
             if errf:
                 errf.close()
         if failed is not None:
-            k, rc = failed
-            if k > 0:
-                with open(os.path.join(tmp, 'part%d.err' % k)) as fh:
+            k, why, extra = failed
+            if why == 'memory':
+                sys.stderr.write(
+                    'error: opening the FSDB alone takes %s, over half of the %s '
+                    'memory budget, so no process has room to read signals. '
+                    'Run with more memory (about %s or more), or narrow the '
+                    'design with --scope.\n'
+                    % (human_size(extra << 20), human_size(budget_mb << 20),
+                       human_size(extra << 21)))
+                sys.exit(1)
+            if extra:                                  # the worker's stderr
+                with open(extra) as fh:
                     lines = [l for l in fh.read().splitlines()
-                             if l.startswith('error')]
+                             if l.startswith('error') or l.startswith('usage')]
                 sys.stderr.write('\n'.join(lines[-5:]) + '\n' if lines else '')
-            if rc < 0:
-                sys.stderr.write('error: fsdb_activity worker %d was killed by '
-                                 'signal %d; no report written.\n' % (k, -rc))
-            sys.exit(rc if rc > 0 else 1)
-
-        counts = {}
-        total_signals = 0
-        for k in range(nparts):
-            ended = False
-            nsig = None
-            with open(os.path.join(tmp, 'part%d.out' % k)) as fh:
-                for line in fh:
-                    parts = line.split()
-                    if not parts or parts[0].startswith('#'):
-                        continue
-                    key = parts[0]
-                    if key == 'timescale':
-                        meta['timescale'] = ' '.join(parts[1:])
-                    elif key == 'signals':
-                        nsig = int(parts[1])
-                    elif key == 'end':
-                        ended = True
-                    else:
-                        t = int(key)
-                        counts[t] = counts.get(t, 0) + int(parts[1])
-            if not ended or nsig is None:
+            if why == 'incomplete':
                 sys.stderr.write('error: fsdb_activity worker %d output was '
                                  'incomplete; no report written.\n' % k)
-                sys.exit(1)
-            total_signals += nsig
-    if total_signals == 0:             # only possible when split across workers
-        sys.stderr.write('error: no signals found%s\n'
-                         % (' under --scope' if args.scope else ''))
-        sys.exit(4)
+            elif why == 2:
+                sys.stderr.write('error: fsdb_activity rejected its options; '
+                                 'it is probably older than this script, so '
+                                 'rebuild it (cd fsdb_activity && make).\n')
+            elif why < 0:
+                sys.stderr.write('error: fsdb_activity worker %d was killed by '
+                                 'signal %d%s; no report written.\n'
+                                 % (k, -why, ' (out of memory? try fewer '
+                                    '--ncores)' if why == -9 else ''))
+            sys.exit(why if isinstance(why, int) and why > 0 else 1)
 
-    with open(out_path, 'w', newline='') as out:
-        writer = csv.writer(out)
-        writer.writerow(['time', ncol, 'total_signals', 'percent_changed'])
-        sink = RowSink(writer, total_signals, args.avg, 'native')
-        for t in sorted(counts):
-            sink.add_native(t, counts[t])
-        sink.flush()
+        # Merge the per-process outputs, each already in time order, as a
+        # stream: memory stays flat however many timestamps there are.
+        files, total_signals = [], 0
+        for path in outputs:
+            fh = open(path)
+            ts, _, nsig = _fsdb_part_header(fh)
+            meta['timescale'] = meta['timescale'] or ts
+            total_signals += nsig or 0
+            files.append(fh)
+        if total_signals == 0:         # only possible when split across workers
+            sys.stderr.write('error: no signals found%s\n'
+                             % (' under --scope' if args.scope else ''))
+            sys.exit(4)
+        with open(out_path, 'w', newline='') as out:
+            writer = csv.writer(out)
+            writer.writerow(['time', ncol, 'total_signals', 'percent_changed'])
+            sink = RowSink(writer, total_signals, args.avg, 'native')
+            merged = heapq.merge(*(_fsdb_part_rows(fh) for fh in files))
+            for t, grp in itertools.groupby(merged, key=lambda r: r[0]):
+                sink.add_native(t, sum(c for _, c in grp))
+            sink.flush()
+        for fh in files:
+            fh.close()
     rows = sink.rows
     if rows == 0:
         sys.stderr.write('error: the FSDB has no value changes%s.\n'
@@ -1426,16 +1646,27 @@ def main():
                     help='parse on N worker processes (native mode only); '
                          '0 = all available cores.  For FSDB input each '
                          'worker is an NPI process with its own Verdi license '
-                         'and hierarchy copy')
+                         'and hierarchy copy; memory use is capped '
+                         'automatically to what the job may use')
     ap.add_argument('--no-progress', action='store_true',
                     help='disable the progress indicator')
+    # Testing / override only: FSDB memory budget when the job limit cannot
+    # be detected (or to exercise the per-process ceiling on a small FSDB).
+    ap.add_argument('--mem-limit', type=_parse_mem, default=None,
+                    help=argparse.SUPPRESS)
     ap.add_argument('--fsdb-reader', metavar='PATH',
                     help='fsdb_activity helper for .fsdb input (default: '
                          '$FSDB_ACTIVITY, next to this script, or $PATH)')
     args = ap.parse_args()
 
+    cores = _available_cores()
     if args.ncores == 0:
-        args.ncores = os.cpu_count() or 1
+        args.ncores = cores
+    elif args.ncores > cores:
+        sys.stderr.write('note: --ncores %d but this job may use only %d '
+                         'core(s); using %d.\n'
+                         % (args.ncores, cores, cores))
+        args.ncores = cores
     if args.avg < 1:
         args.avg = 1
 
